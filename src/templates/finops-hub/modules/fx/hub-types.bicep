@@ -31,6 +31,13 @@ type IdNameObject = { id: string, name: string }
     queue: 'Resource ID and name for the queue storage DNS zone.'
     table: 'Resource ID and name for the table storage DNS zone.'
   }
+  subnetNames: {
+    dataExplorer: 'Name of the subnet for the Data Explorer instance.'
+    dataFactory: 'Name of the subnet for Data Factory instances.'
+    keyVault: 'Name of the subnet for Key Vault instances.'
+    scripts: 'Name of the subnet for deployment script storage.'
+    storage: 'Name of the subnet for storage accounts.'
+  }
   subnets: {
     dataExplorer: 'Resource ID of the subnet for the Data Explorer instance.'
     dataFactory: 'Resource ID of the subnet for Data Factory instances.'
@@ -48,6 +55,13 @@ type HubRoutingProperties = {
     dfs: IdNameObject
     queue: IdNameObject
     table: IdNameObject
+  }
+  subnetNames: {
+    dataExplorer: string
+    dataFactory: string
+    keyVault: string
+    scripts: string
+    storage: string
   }
   subnets: {
     dataExplorer: string
@@ -71,7 +85,8 @@ type HubRoutingProperties = {
     enableTelemetry: 'Indicates whether telemetry should be enabled for deployments.'
     keyVaultSku: 'KeyVault SKU. Allowed values: "standard", "premium".'
     keyVaultEnablePurgeProtection: 'Indicates whether purge protection is enabled for the Key Vault. When enabled, deleted Key Vault and its secrets cannot be permanently deleted until the retention period expires, which is required for compliance in some environments.'
-    networkAddressPrefix: 'Address prefix for the FinOps hub isolated virtual network, if private network routing is enabled.'
+    networkMode: 'Indicates whether private routing creates a new virtual network ("new") or uses an existing virtual network ("existing").'
+    networkAddressPrefix: 'Address prefix for the FinOps hub isolated virtual network when private network routing is enabled and networkMode is "new".'
     privateRouting: 'Indicates whether private network routing is enabled.'
     publisherIsolation: 'Indicates whether FinOps hub resources should be separated by publisher for advanced security.'
     storageInfrastructureEncryption: 'Indicates whether infrastructure encryption is enabled for the storage account.'
@@ -95,8 +110,10 @@ type HubProperties = {
     enableTelemetry: bool
     keyVaultSku: string
     keyVaultEnablePurgeProtection: bool
+    networkMode: string
     networkAddressPrefix: string
     privateRouting: bool
+    createPrivateDnsZones: bool
     publisherIsolation: bool
     storageInfrastructureEncryption: bool
     storageSku: string
@@ -175,6 +192,8 @@ func idName(name string, resourceType string) IdNameObject => {
 // cSpell:ignore privatelink
 func dnsZoneIdName(type string) IdNameObject => idName('privatelink.${type}.${environment().suffixes.storage}', 'Microsoft.Network/privateDnsZones')
 
+func resolvedNetworkId(enablePublicAccess bool, virtualNetworkMode string, existingVirtualNetworkResourceId string, networkName string) string => enablePublicAccess ? '' : (virtualNetworkMode == 'existing' ? existingVirtualNetworkResourceId : resourceId('Microsoft.Network/virtualNetworks', networkName))
+
 //------------------------------------------------------------------------------
 // Hub config
 //------------------------------------------------------------------------------
@@ -192,15 +211,21 @@ func newHubInternal(
   keyVaultEnablePurgeProtection bool,
   enableInfrastructureEncryption bool,
   enablePublicAccess bool,
+  privateEndpointSubnetName string,
+  scriptSubnetName string,
+  dataExplorerSubnetName string,
+  createPrivateDnsZones bool,
+  virtualNetworkMode string,
   networkName string,
   networkAddressPrefix string,
-  isTelemetryEnabled bool,
+  existingVirtualNetworkResourceId string,
+  isTelemetryEnabled bool
 ) HubProperties => {
   id: id
   name: name
   location: location ?? resourceGroup().location
   tags: union(tags, {
-    'cm-resource-parent': id  // cm-resource-parent tag groups resources in Cost Management
+    'cm-resource-parent': id // cm-resource-parent tag groups resources in Cost Management
     'ftk-tool': 'FinOps hubs'
     'ftk-version': finOpsToolkitVersion
   })
@@ -210,15 +235,17 @@ func newHubInternal(
     enableTelemetry: isTelemetryEnabled ?? true
     keyVaultSku: keyVaultSku
     keyVaultEnablePurgeProtection: keyVaultEnablePurgeProtection
+    networkMode: enablePublicAccess ? 'new' : virtualNetworkMode
     networkAddressPrefix: networkAddressPrefix
     privateRouting: !enablePublicAccess
+    createPrivateDnsZones: !enablePublicAccess && createPrivateDnsZones
     publisherIsolation: false  // TODO: Expose publisher isolation option
     storageInfrastructureEncryption: enableInfrastructureEncryption
     storageSku: storageSku
   }
   routing: {
-    networkId: enablePublicAccess ? '' : resourceId('Microsoft.Network/virtualNetworks', networkName)
-    networkName: enablePublicAccess ? '' : networkName
+    networkId: resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName)
+    networkName: enablePublicAccess ? '' : last(split(resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName), '/'))
     scriptStorage: enablePublicAccess ? '' : '${take(safeStorageName(name), 16 - length(suffix))}script${suffix}'
     dnsZones: {
       blob:  enablePublicAccess ? { id:'', name:'' } : dnsZoneIdName('blob')
@@ -226,12 +253,19 @@ func newHubInternal(
       queue: enablePublicAccess ? { id:'', name:'' } : dnsZoneIdName('queue')
       table: enablePublicAccess ? { id:'', name:'' } : dnsZoneIdName('table')
     }
+    subnetNames: {
+      dataExplorer: enablePublicAccess ? '' : dataExplorerSubnetName
+      dataFactory:  enablePublicAccess ? '' : privateEndpointSubnetName
+      keyVault:     enablePublicAccess ? '' : privateEndpointSubnetName
+      scripts:      enablePublicAccess ? '' : scriptSubnetName
+      storage:      enablePublicAccess ? '' : privateEndpointSubnetName
+    }
     subnets: {
-      dataExplorer: enablePublicAccess ? '' : resourceId('Microsoft.Network/virtualNetworks/subnets', networkName, 'dataExplorer-subnet')!
-      dataFactory:  enablePublicAccess ? '' : resourceId('Microsoft.Network/virtualNetworks/subnets', networkName, 'private-endpoint-subnet')!
-      keyVault:     enablePublicAccess ? '' : resourceId('Microsoft.Network/virtualNetworks/subnets', networkName, 'private-endpoint-subnet')!
-      scripts:      enablePublicAccess ? '' : resourceId('Microsoft.Network/virtualNetworks/subnets', networkName, 'script-subnet')!
-      storage:      enablePublicAccess ? '' : resourceId('Microsoft.Network/virtualNetworks/subnets', networkName, 'private-endpoint-subnet')!
+      dataExplorer: enablePublicAccess ? '' : '${resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName)}/subnets/${dataExplorerSubnetName}'
+      dataFactory:  enablePublicAccess ? '' : '${resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName)}/subnets/${privateEndpointSubnetName}'
+      keyVault:     enablePublicAccess ? '' : '${resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName)}/subnets/${privateEndpointSubnetName}'
+      scripts:      enablePublicAccess ? '' : '${resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName)}/subnets/${scriptSubnetName}'
+      storage:      enablePublicAccess ? '' : '${resolvedNetworkId(enablePublicAccess, virtualNetworkMode, existingVirtualNetworkResourceId, networkName)}/subnets/${privateEndpointSubnetName}'
     }
   }
   core: {
@@ -251,24 +285,40 @@ func newHub(
   keyVaultEnablePurgeProtection bool,
   enableInfrastructureEncryption bool,
   enablePublicAccess bool,
+  privateEndpointSubnetName string,
+  scriptSubnetName string,
+  dataExplorerSubnetName string,
+  createPrivateDnsZones bool,
+  virtualNetworkMode string,
   networkAddressPrefix string,
-  isTelemetryEnabled bool,
-) HubProperties => newHubInternal(
-  '${resourceGroup().id}/providers/Microsoft.Cloud/hubs/${name}',  // id
-  name,
-  uniqueString(name, resourceGroup().id),  // suffix
-  location,
-  tags,
-  tagsByResource,
-  storageSku,
-  keyVaultSku,
-  keyVaultEnablePurgeProtection,
-  enableInfrastructureEncryption,
-  enablePublicAccess,
-  '${safeStorageName(name)}-vnet-${location}',    // networkName, cSpell:ignore vnet
-  networkAddressPrefix,
-  isTelemetryEnabled ?? true
-)
+  existingVirtualNetworkResourceId string,
+  isTelemetryEnabled bool
+) HubProperties =>
+  newHubInternal(
+    '${resourceGroup().id}/providers/Microsoft.Cloud/hubs/${name}',
+    // id
+    name,
+    uniqueString(name, resourceGroup().id),
+    // suffix
+    location,
+    tags,
+    tagsByResource,
+    storageSku,
+    keyVaultSku,
+    keyVaultEnablePurgeProtection,
+    enableInfrastructureEncryption,
+    enablePublicAccess,
+    privateEndpointSubnetName,
+    scriptSubnetName,
+    dataExplorerSubnetName,
+    createPrivateDnsZones,
+    virtualNetworkMode,
+    '${safeStorageName(name)}-vnet-${location}',
+    // networkName, cSpell:ignore vnet
+    networkAddressPrefix,
+    existingVirtualNetworkResourceId,
+    isTelemetryEnabled ?? true
+  )
 
 //------------------------------------------------------------------------------
 // App config

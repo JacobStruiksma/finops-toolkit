@@ -18,12 +18,14 @@ param hub HubProperties
 
 var nsgName = '${hub.routing.networkName}-nsg'
 
-// Workaround https://github.com/Azure/bicep/issues/1853
-var finopsHubSubnetName = 'private-endpoint-subnet'
-var scriptSubnetName = 'script-subnet'
-var dataExplorerSubnetName = 'dataExplorer-subnet'
+var createNetwork = hub.options.privateRouting && hub.options.networkMode == 'new'
 
-var subnets = !hub.options.privateRouting ? [] : [
+// Workaround https://github.com/Azure/bicep/issues/1853
+var finopsHubSubnetName = hub.routing.subnetNames.storage
+var scriptSubnetName = hub.routing.subnetNames.scripts
+var dataExplorerSubnetName = hub.routing.subnetNames.dataExplorer
+
+var subnets = !createNetwork ? [] : [
   {
     name: finopsHubSubnetName
     properties: {
@@ -80,7 +82,7 @@ var subnets = !hub.options.privateRouting ? [] : [
 // Network
 //------------------------------------------------------------------------------
 
-resource nsg 'Microsoft.Network/networkSecurityGroups@2023-11-01' = if (hub.options.privateRouting) {
+resource nsg 'Microsoft.Network/networkSecurityGroups@2023-11-01' = if (createNetwork) {
   name: nsgName
   location: hub.location
   tags: getHubTags(hub, 'Microsoft.Storage/networkSecurityGroups')
@@ -168,7 +170,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-11-01' = if (hub.opti
   }
 }
 
-resource vNet 'Microsoft.Network/virtualNetworks@2023-11-01' = if (hub.options.privateRouting) {
+resource vNet 'Microsoft.Network/virtualNetworks@2023-11-01' = if (createNetwork) {
   name: hub.routing.networkName
   location: hub.location
   tags: getHubTags(hub, 'Microsoft.Storage/virtualNetworks')
@@ -197,11 +199,11 @@ resource vNet 'Microsoft.Network/virtualNetworks@2023-11-01' = if (hub.options.p
 //------------------------------------------------------------------------------
 
 // Required for the Azure portal and Storage Explorer
-resource blobPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting) {
+resource blobPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting && hub.options.createPrivateDnsZones) {
   name: string(hub.routing.dnsZones.blob.name)
-  dependsOn: [
+  dependsOn: createNetwork ? [
     vNet
-  ]
+  ] : []
   location: 'global'
   tags: getHubTags(hub, 'Microsoft.Storage/privateDnsZones')
   properties: {}
@@ -220,11 +222,11 @@ resource blobPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if 
 }
 
 // Required for Power BI
-resource dfsPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting) {
+resource dfsPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting && hub.options.createPrivateDnsZones) {
   name: string(hub.routing.dnsZones.dfs.name)
-  dependsOn: [
+  dependsOn: createNetwork ? [
     vNet
-  ]
+  ] : []
   location: 'global'
   tags: getHubTags(hub, 'Microsoft.Storage/privateDnsZones')
   properties: {}
@@ -243,11 +245,11 @@ resource dfsPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (
 }
 
 // Required for Azure Data Explorer
-resource queuePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting) {
+resource queuePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting && hub.options.createPrivateDnsZones) {
   name: string(hub.routing.dnsZones.queue.name)
-  dependsOn: [
+  dependsOn: createNetwork ? [
     vNet
-  ]
+  ] : []
   location: 'global'
   tags: getHubTags(hub, 'Microsoft.Storage/privateDnsZones')
   properties: {}
@@ -266,11 +268,11 @@ resource queuePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if
 }
 
 // Required for Azure Data Explorer
-resource tablePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting) {
+resource tablePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (hub.options.privateRouting && hub.options.createPrivateDnsZones) {
   name: string(hub.routing.dnsZones.table.name)
-  dependsOn: [
+  dependsOn: createNetwork ? [
     vNet
-  ]
+  ] : []
   location: 'global'
   tags: getHubTags(hub, 'Microsoft.Storage/privateDnsZones')
   properties: {}
@@ -294,9 +296,9 @@ resource tablePrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if
 
 resource scriptStorageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' = if (hub.options.privateRouting) {
   name: hub.routing.scriptStorage
-  dependsOn: [
+  dependsOn: createNetwork ? [
     vNet::scriptSubnet
-  ]
+  ] : []
   location: hub.location
   sku: {
     name: 'Standard_LRS'
@@ -325,9 +327,9 @@ resource scriptStorageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' = i
 
 resource scriptEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = if (hub.options.privateRouting) {
   name: '${scriptStorageAccount.name}-blob-ep'
-  dependsOn: [
+  dependsOn: createNetwork ? [
     vNet::scriptSubnet
-  ]
+  ] : []
   location: hub.location
   tags: getHubTags(hub, 'Microsoft.Network/privateEndpoints')
   properties: {
@@ -345,7 +347,7 @@ resource scriptEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = if (hu
     ]
   }
   
-  resource scriptPrivateDnsZoneGroup 'privateDnsZoneGroups' = {
+  resource scriptPrivateDnsZoneGroup 'privateDnsZoneGroups' = if (hub.options.privateRouting && hub.options.createPrivateDnsZones) {
     name: 'blob-endpoint-zone'
     properties: {
       privateDnsZoneConfigs: [
@@ -369,21 +371,21 @@ resource scriptEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = if (hu
 output config HubProperties = hub
 
 @description('Resource ID of the virtual network.')
-output vNetId string = !hub.options.privateRouting ? '' : vNet.id
+output vNetId string = !hub.options.privateRouting ? '' : hub.routing.networkId
 
 @description('Virtual network address prefixes.')
 #disable-next-line BCP318 // Null safety warning for conditional resource access
-output vNetAddressSpace array = !hub.options.privateRouting ? [] : vNet.properties.addressSpace.addressPrefixes
+output vNetAddressSpace array = !hub.options.privateRouting || !createNetwork ? [] : vNet.properties.addressSpace.addressPrefixes
 
 @description('Virtual network subnets.')
 #disable-next-line BCP318 // Null safety warning for conditional resource access
-output vNetSubnets array = !hub.options.privateRouting ? [] : vNet.properties.subnets
+output vNetSubnets array = !hub.options.privateRouting || !createNetwork ? [] : vNet.properties.subnets
 
 @description('Resource ID of the FinOps hub network subnet.')
-output finopsHubSubnetId string = !hub.options.privateRouting ? '' : vNet::finopsHubSubnet.id
+output finopsHubSubnetId string = !hub.options.privateRouting ? '' : hub.routing.subnets.storage
 
 @description('Resource ID of the script storage account network subnet.')
-output scriptSubnetId string = !hub.options.privateRouting ? '' : vNet::scriptSubnet.id
+output scriptSubnetId string = !hub.options.privateRouting ? '' : hub.routing.subnets.scripts
 
 @description('Resource ID of the Data Explorer network subnet.')
-output dataExplorerSubnetId string = !hub.options.privateRouting ? '' : vNet::dataExplorerSubnet.id
+output dataExplorerSubnetId string = !hub.options.privateRouting ? '' : hub.routing.subnets.dataExplorer

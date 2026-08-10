@@ -920,10 +920,81 @@
                 }
               },
               {
+                "name": "privateEndpointSubnetName",
+                "type": "Microsoft.Common.TextBox",
+                "label": "Private endpoint subnet name",
+                "toolTip": "Subnet name for storage, key vault, and Data Factory managed private endpoint routing.",
+                "defaultValue": "private-endpoint-subnet",
+                "visible": "[equals(steps('advanced').networking.enablePublicAccess, false)]"
+              },
+              {
+                "name": "scriptSubnetName",
+                "type": "Microsoft.Common.TextBox",
+                "label": "Script subnet name",
+                "toolTip": "Subnet name used by deployment scripts.",
+                "defaultValue": "script-subnet",
+                "visible": "[equals(steps('advanced').networking.enablePublicAccess, false)]"
+              },
+              {
+                "name": "dataExplorerSubnetName",
+                "type": "Microsoft.Common.TextBox",
+                "label": "Data Explorer subnet name",
+                "toolTip": "Subnet name used for Azure Data Explorer private endpoints.",
+                "defaultValue": "dataExplorer-subnet",
+                "visible": "[equals(steps('advanced').networking.enablePublicAccess, false)]"
+              },
+              ,
+              {
+                "name": "createPrivateDnsZones",
+                "type": "Microsoft.Common.CheckBox",
+                "label": "Create private DNS zones",
+                "toolTip": "Uncheck in enterprise environments where a centralized DNS resolver (such as Azure Private DNS Resolver or an on-premises forwarder) manages private DNS registration. When unchecked, private endpoints are still created but no private DNS zones or zone groups are deployed.",
+                "defaultValue": true,
+                "visible": "[equals(steps('advanced').networking.enablePublicAccess, false)]"
+              },
+              {
+                "name": "virtualNetworkMode",
+                "type": "Microsoft.Common.DropDown",
+                "label": "Virtual network mode",
+                "toolTip": "Choose whether FinOps hubs should create a new virtual network and subnets or use an existing virtual network.",
+                "defaultValue": "New",
+                "constraints": {
+                  "allowedValues": [
+                    {
+                      "label": "New",
+                      "description": "Create a new virtual network and subnets.",
+                      "value": "new"
+                    },
+                    {
+                      "label": "Existing",
+                      "description": "Use an existing virtual network and existing subnets.",
+                      "value": "existing"
+                    }
+                  ]
+                },
+                "visible": "[equals(steps('advanced').networking.enablePublicAccess, false)]"
+              },
+              {
+                "name": "existingVirtualNetworkResourceId",
+                "type": "Microsoft.Common.TextBox",
+                "label": "Existing virtual network resource ID",
+                "toolTip": "Resource ID of the existing virtual network to use when virtual network mode is Existing.",
+                "defaultValue": "",
+                "constraints": {
+                  "validations": [
+                    {
+                      "isValid": "[or(not(equals(steps('advanced').networking.virtualNetworkMode, 'existing')), and(startsWith(steps('advanced').networking.existingVirtualNetworkResourceId, '/subscriptions/'), contains(steps('advanced').networking.existingVirtualNetworkResourceId, '/providers/Microsoft.Network/virtualNetworks/')))]",
+                      "message": "Enter a valid virtual network resource ID in the format /subscriptions/.../providers/Microsoft.Network/virtualNetworks/<name>."
+                    }
+                  ]
+                },
+                "visible": "[and(equals(steps('advanced').networking.enablePublicAccess, false), equals(steps('advanced').networking.virtualNetworkMode, 'existing'))]"
+              },
+              {
                 "name": "virtualNetworkAddressPrefix",
                 "type": "Microsoft.Common.TextBox",
                 "label": "Address prefix",
-                "toolTip": "Address space for the workload. Minimum /26 subnet size is required for the workload.",
+                "toolTip": "Address space for the workload. Minimum /26 subnet size is required.",
                 "defaultValue": "10.20.30.0/26",
                 "constraints": {
                   "validations": [
@@ -933,7 +1004,7 @@
                     }
                   ]
                 },
-                "visible": "[equals(steps('advanced').networking.enablePublicAccess, false)]"
+                "visible": "[and(equals(steps('advanced').networking.enablePublicAccess, false), equals(steps('advanced').networking.virtualNetworkMode, 'new'))]"
               }
             ],
             "visible": true
@@ -977,7 +1048,13 @@
       "enableAHBRecommendations": "[steps('recommendations').optional.enableAHBRecommendations]",
       "enableSpotRecommendations": "[steps('recommendations').optional.enableSpotRecommendations]",
       "enablePublicAccess": "[steps('advanced').networking.enablePublicAccess]",
+      "privateEndpointSubnetName": "[steps('advanced').networking.privateEndpointSubnetName]",
+      "scriptSubnetName": "[steps('advanced').networking.scriptSubnetName]",
+      "dataExplorerSubnetName": "[steps('advanced').networking.dataExplorerSubnetName]",
+      "createPrivateDnsZones": "[steps('advanced').networking.createPrivateDnsZones]",
+      "virtualNetworkMode": "[steps('advanced').networking.virtualNetworkMode]",
       "virtualNetworkAddressPrefix": "[steps('advanced').networking.virtualNetworkAddressPrefix]",
+      "existingVirtualNetworkResourceId": "[steps('advanced').networking.existingVirtualNetworkResourceId]",
       "dataExplorerSku": "[steps('pricing').dataExplorer.dataExplorerSku]",
       "exportRetentionInDays": "[steps('retention').storage.msexportsDays]",
       "ingestionRetentionInMonths": "[steps('retention').storage.ingestionMonths]",

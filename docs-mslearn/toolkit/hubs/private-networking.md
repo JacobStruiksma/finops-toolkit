@@ -3,7 +3,7 @@ title: Configure private networking in FinOps hubs
 description: Learn about data access options with FinOps hubs and how to configure secure access to your data with private endpoints.
 author: flanakin
 ms.author: micflan
-ms.date: 04/01/2026
+ms.date: 08/12/2026
 ms.topic: how-to
 ms.service: finops
 ms.reviewer: micflan
@@ -88,7 +88,6 @@ If you need to reduce costs or simplify your FinOps hub deployment, you can remo
 ### Steps to remove private networking
 
 1. **Plan the transition**:
-
    - Identify all users and systems currently accessing the hub via private networking
    - Coordinate with your network administrators about the change
    - Schedule maintenance window as the hub will be temporarily inaccessible during the transition
@@ -98,7 +97,6 @@ If you need to reduce costs or simplify your FinOps hub deployment, you can remo
    You have two options to redeploy your FinOps hub with public access:
 
    **Option 1: Redeploy from existing deployment**
-
    - Navigate to your FinOps hub resource group in the Azure portal
    - Go to the **Deployments** tab on the resource group
    - Find and open the original FinOps hub deployment
@@ -108,7 +106,6 @@ If you need to reduce costs or simplify your FinOps hub deployment, you can remo
    - Deploy the updated configuration
 
    **Option 2: Deploy latest toolkit version**
-
    - Install the latest current version of the FinOps toolkit
    - Use the same resource group name, hub name, and Data Explorer cluster name as your existing deployment
    - These values can be obtained from the original deployment template or the config.json file in your hub storage account
@@ -116,13 +113,11 @@ If you need to reduce costs or simplify your FinOps hub deployment, you can remo
    - Deploy with the same configuration to update your existing hub
 
 3. **Verify the changes**:
-
    - Confirm that storage accounts, Data Explorer, and Key Vault are accessible via public endpoints
    - Test data access from Power BI and other connected systems
    - Verify that Azure Data Factory pipelines continue to run successfully
 
 4. **Clean up networking resources** (optional):
-
    - Once you've confirmed the hub is working correctly with public access, you can delete the networking resources to stop incurring networking costs
    - Delete resources in the following order to avoid dependency conflicts:
      1. Private endpoints
@@ -155,19 +150,82 @@ If you need to reduce costs or simplify your FinOps hub deployment, you can remo
 
 ## FinOps hub virtual network
 
-When private access is selected, your FinOps hub instance includes a virtual network to ensure communication between its various components remain private.
+When private access is selected, choose your mode using **virtualNetworkMode**:
 
-- The virtual network can be any subnet size from **/8** to **/26**, with a minimum of **/26** (64 IP addresses) required. The default is **/26** to conserve IP addresses while providing the minimum required subnet sizes for Container Services (used during deployments for running scripts) and Data Explorer.
-- The IP range can be set at the time of deployment and defaults to **10.20.30.0/26**. Choose a larger subnet (like **/24** or smaller) if you need additional address space for services such as Power BI VNet Data Gateway.
+- Set **virtualNetworkMode** to `new` to create a new virtual network and subnets.
+- Set **virtualNetworkMode** to `existing` to use your existing virtual network. In this mode, set **existingVirtualNetworkResourceId**.
 
-If necessary, you can create the virtual network, subnets, and optionally peer it with your hub network before deploying FinOps hubs if you follow these requirements:
+### Virtual network mode and parameter usage
 
-- The virtual network should be a minimum of **/26** in size (64 IP addresses) but can be any size up to **/8** (16,777,216 IP addresses).
-- The name should be `<HubName>-vNet`.
-- The virtual network must be divided into three subnets with the service delegations as specified:
-  - **private-endpoint-subnet** (**/28**) – no service delegations configured; hosts private endpoints for storage and key vault.
-  - **script-subnet** (**/28**) – delegated to container services for running scripts during deployment.
-  - **dataExplorer-subnet** (**/27**) – delegated to Azure Data Explorer.
+The following table shows which network parameters are used in each mode when private access is enabled (**enablePublicAccess** = `false`).
+
+| Parameter                            | `new` mode | `existing` mode | Notes                                                                                                                                                                                                            |
+| ------------------------------------ | ---------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **virtualNetworkMode**               | Used       | Used            | Selects whether FinOps hubs creates a VNet or reuses one.                                                                                                                                                        |
+| **privateEndpointSubnetName**        | Used       | Used            | Subnet name used for storage, Key Vault, and script storage private endpoints.                                                                                                                                   |
+| **scriptSubnetName**                 | Used       | Used            | Subnet name used for deployment script container groups.                                                                                                                                                         |
+| **dataExplorerSubnetName**           | Used       | Used            | Subnet name used for Azure Data Explorer private endpoint.                                                                                                                                                       |
+| **createPrivateDnsZones**            | Always on  | Used            | In `new` mode, FinOps hubs always creates private DNS zones and links them to the created virtual network. In `existing` mode, set to `false` to skip private DNS zones, zone groups, and virtual network links. |
+| **virtualNetworkAddressPrefix**      | Used       | Ignored         | Used only when creating a new VNet.                                                                                                                                                                              |
+| **enableNatGateway**                 | Used       | Ignored         | NAT Gateway is only created/attached when mode is `new`.                                                                                                                                                         |
+| **existingVirtualNetworkResourceId** | Ignored    | Used            | Required in `existing` mode to target your VNet.                                                                                                                                                                 |
+
+In `new` mode:
+
+- Set **virtualNetworkAddressPrefix** to define the VNet address space.
+- FinOps hubs always creates the required private DNS zones and links them to the new virtual network.
+- The virtual network can be any subnet size from **/8** to **/26**, with a minimum of **/26** (64 IP addresses) required.
+- The default IP range is **10.20.30.0/26**.
+- FinOps hubs creates three subnets from this range: **/28** for private endpoints, **/28** for deployment scripts, and **/27** reserved for Azure Data Explorer private endpoints.
+- Choose a larger range (for example, **/24**) if you need more private address space for adjacent services like Power BI VNet Data Gateway.
+
+In `existing` mode:
+
+### Existing mode: bring your own virtual network subnet requirements and mapping
+
+If you're using an existing virtual network, configure these settings before deploying FinOps hubs:
+
+- Set **existingVirtualNetworkResourceId** to your VNet resource ID.
+- Set **createPrivateDnsZones** to `true` to let FinOps hubs create the required private DNS zones, link them to your existing virtual network, and attach private endpoints to those zones.
+- Set **createPrivateDnsZones** to `false` if your organization manages private DNS separately. In this case, FinOps hubs still creates private endpoints, but doesn't create private DNS zones, private DNS zone groups, or virtual network links.
+- **virtualNetworkAddressPrefix** is ignored.
+- FinOps hubs uses your existing VNet address space and the subnet names you provide.
+
+When **enablePublicAccess** is set to `false`, FinOps hubs uses the following requirements and subnet mapping:
+
+| Subnet parameter              | Default subnet name         | Minimum size | Required configuration                                                                                                                                                                      | Contains                                                                                                                              |
+| ----------------------------- | --------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **privateEndpointSubnetName** | **private-endpoint-subnet** | **/28**      | Service endpoint recommended: **Microsoft.Storage**                                                                                                                                         | Azure Resource Manager private endpoints for hub storage (`blob`, `dfs`), Key Vault (`vault`), and deployment script storage (`blob`) |
+| **scriptSubnetName**          | **script-subnet**           | **/28**      | Subnet delegation required: **Microsoft.ContainerInstance/containerGroups**. Service endpoint recommended: **Microsoft.Storage**. Outbound routing required if default outbound is blocked. | Deployment script container groups (Azure Container Instances)                                                                        |
+| **dataExplorerSubnetName**    | **dataExplorer-subnet**     | **/27**      | Outbound routing required if default outbound is blocked.                                                                                                                                   | Azure Data Explorer cluster private endpoint (`cluster`)                                                                              |
+
+Virtual network requirement: minimum **/26** address space.
+
+> [!NOTE]
+> Data Factory managed private endpoints (for storage, Key Vault, and Data Explorer) are created in the Data Factory managed virtual network, not as Azure Resource Manager private endpoints in your bring-your-own virtual network subnets.
+
+> [!NOTE]
+> Azure Data Explorer private endpoints commonly consume 8 private IPs in the subnet baseline (engine endpoint, data management endpoint, and transient storage endpoints). This baseline doesn't scale linearly with **dataExplorerSkuCapacity** (node count). Additional private IP usage is primarily tied to high-ingestion scenarios that scale transient storage endpoints. The **/27** minimum in bring-your-own virtual network mode is kept to provide operational headroom.
+
+### Bring your own virtual network NSG settings
+
+If your existing subnets have NSGs attached, configure rules that allow the same baseline traffic pattern FinOps hubs configures when it creates a new virtual network.
+
+| Direction | Priority | Rule                          | Source            | Destination    | Port/Protocol | Access |
+| --------- | -------- | ----------------------------- | ----------------- | -------------- | ------------- | ------ |
+| Inbound   | 100      | AllowVnetInBound              | VirtualNetwork    | VirtualNetwork | Any / Any     | Allow  |
+| Inbound   | 200      | AllowAzureLoadBalancerInBound | AzureLoadBalancer | Any            | Any / Any     | Allow  |
+| Inbound   | 4096     | DenyAllInBound                | Any               | Any            | Any / Any     | Deny   |
+| Outbound  | 100      | AllowVnetOutBound             | VirtualNetwork    | VirtualNetwork | Any / Any     | Allow  |
+| Outbound  | 200      | AllowInternetOutBound         | Any               | Internet       | Any / Any     | Allow  |
+| Outbound  | 4096     | DenyAllOutBound               | Any               | Any            | Any / Any     | Deny   |
+
+Apply these rules to the NSGs used by the private endpoint, script, and Data Explorer subnets, or configure equivalent rules in your central firewall/segmentation architecture.
+
+> [!NOTE]
+> FinOps hubs only creates/attaches NAT Gateway when it creates a new virtual network. In bring-your-own virtual network mode, configure outbound routing in your own network architecture.
+
+You can override all subnet names at deployment time. FinOps hubs uses the configured names for both new and existing virtual network modes.
 
 <br>
 
