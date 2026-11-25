@@ -1210,7 +1210,36 @@ function Invoke-FinOpsMultitool {
                 Should -Invoke Connect-AzAccount -Times 0 -Exactly
             }
 
-            It 'Skips orphan cost enrichment in GraphOnly mode' {
+            It 'Passes the selected Kusto provider to orphan scans only for <Source>' -ForEach @(
+                @{ Source = 'Hub'; HasKusto = $true }
+                @{ Source = 'Hub'; HasKusto = $false }
+                @{ Source = 'API'; HasKusto = $false }
+            ) {
+                $launcherAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RealMultitoolRoot 'Invoke-FinOpsMultitool.ps1'), [ref]$null, [ref]$null)
+                foreach ($definition in $launcherAst.FindAll({
+                            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                            $args[0].Name -in @('Invoke-SelectedScans', 'Write-SectionHeader', 'Write-FinOpsConsole')
+                        }, $true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+                Mock Get-OrphanedResources { [pscustomobject]@{ Orphans = @(); TotalCount = 0; HasData = $false } }
+                $subscriptions = @([pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'test' })
+                $sourceChoice = @{ Source = $Source; HubStorage = $null; HubProviderResolved = $true }
+                if ($HasKusto) {
+                    $sourceChoice.HubProvider = @{ Found = $true; Mode = 'KustoLocal'; ClusterUri = 'http://localhost:8082'; Database = 'Hub'; UseAuth = $false }
+                }
+
+                $result = Invoke-SelectedScans -Modules @(@{ Name = 'Orphaned Resources'; Fn = 'Get-OrphanedResources'; Selected = $true }) -Subscriptions $subscriptions -DataSource $sourceChoice
+
+                $result['_error_Get-OrphanedResources'] | Should -BeNullOrEmpty
+                Should -Invoke Get-OrphanedResources -Times 1 -Exactly -ParameterFilter {
+                    (-not $SkipCost) -and $(if ($HasKusto) { $HubProvider.ClusterUri -eq 'http://localhost:8082' } else { $null -eq $HubProvider })
+                }
+                Should -Invoke Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool -Times 0 -Exactly
+            }
+
+            It 'Skips orphan cost enrichment in GraphOnly mode with verbose <Enabled>' -ForEach @(
+                @{ Enabled = $true }
+                @{ Enabled = $false }
+            ) {
                 $env:FINOPS_HUB_KUSTO_URI = $null
                 Mock Get-OrphanedResources { [pscustomobject]@{ Orphans = @(); TotalCount = 0; HasData = $false } }
 
