@@ -23,12 +23,17 @@ function Search-AzGraphSafe {
         [int]$MaxRetries = 2,
         [switch]$All,
         [ValidateRange(1, 10000)]
-        [int]$MaxPages = 100
+        [int]$MaxPages = 100,
+        # Queries every scope the caller can read, including management groups,
+        # instead of only the listed subscriptions. Cannot be combined with -Subscription.
+        [switch]$UseTenantScope
     )
+
+    if ($UseTenantScope -and $Subscription) { throw 'UseTenantScope cannot be combined with Subscription.' }
 
     if (-not $All) {
         return Invoke-AzGraphQueryPage -Query $Query -Subscription $Subscription -First $First `
-            -SkipToken $SkipToken -TimeoutSeconds $TimeoutSeconds -MaxRetries $MaxRetries
+            -SkipToken $SkipToken -TimeoutSeconds $TimeoutSeconds -MaxRetries $MaxRetries -UseTenantScope:$UseTenantScope
     }
 
     # Resource Graph caps a response at $First rows and hands back a continuation
@@ -44,7 +49,7 @@ function Search-AzGraphSafe {
     do {
         $usedToken = $token
         $page = Invoke-AzGraphQueryPage -Query $Query -Subscription $Subscription -First $First `
-            -SkipToken $usedToken -TimeoutSeconds $TimeoutSeconds -MaxRetries $MaxRetries
+            -SkipToken $usedToken -TimeoutSeconds $TimeoutSeconds -MaxRetries $MaxRetries -UseTenantScope:$UseTenantScope
 
         if (-not $page) {
             throw "Resource Graph query failed after $pageCount page(s); results are incomplete."
@@ -84,15 +89,17 @@ function Invoke-AzGraphQueryPage {
         [int]$First = 1000,
         [string]$SkipToken,
         [int]$TimeoutSeconds = 60,
-        [int]$MaxRetries = 2
+        [int]$MaxRetries = 2,
+        [switch]$UseTenantScope
     )
 
     for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
         $ps = [powershell]::Create()
         $ps.RunspacePool = $script:RunspacePool
         [void]$ps.AddScript({
-                param($q, $s, $f, $st)
-                $p = @{ Query = $q; Subscription = $s; First = $f; ErrorAction = 'Stop' }
+                param($q, $s, $f, $st, $tenant)
+                $p = @{ Query = $q; First = $f; ErrorAction = 'Stop' }
+                if ($tenant) { $p['UseTenantScope'] = $true } else { $p['Subscription'] = $s }
                 if ($st) { $p['SkipToken'] = $st }
                 $r = Search-AzGraph @p
                 $json = if ($r.Data -and $r.Data.Count -gt 0) {
@@ -104,7 +111,7 @@ function Invoke-AzGraphQueryPage {
                     SkipToken = $r.SkipToken
                     Count     = if ($r.Data) { $r.Data.Count } else { 0 }
                 }
-            }).AddArgument($Query).AddArgument($Subscription).AddArgument($First).AddArgument($SkipToken)
+            }).AddArgument($Query).AddArgument($Subscription).AddArgument($First).AddArgument($SkipToken).AddArgument([bool]$UseTenantScope)
 
         $asyncResult = $ps.BeginInvoke()
         Wait-ForRunspace -AsyncResult $asyncResult -TimeoutSeconds $TimeoutSeconds

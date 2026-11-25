@@ -271,7 +271,7 @@ Describe 'Policy effect resolution' {
                 }
                 Should -Invoke Invoke-AzRestMethodWithRetry -Times 3 -Exactly
                 Should -Invoke Search-AzGraphSafe -Times 1 -Exactly -ParameterFilter {
-                    @($Subscription).Count -eq 1 -and $Subscription[0] -eq $subscriptionId
+                    $Query -like '*policystates*' -and @($Subscription).Count -eq 1 -and $Subscription[0] -eq $subscriptionId
                 }
                 Should -Invoke Get-AzContext -Times 0 -Exactly
                 Should -Invoke Invoke-RestMethod -Times 0 -Exactly
@@ -391,6 +391,7 @@ Describe 'Policy effect resolution' {
 
                 $result = Get-PolicyInventory -Subscriptions @([pscustomobject]@{ Id = $subId; Name = 'Selected' })
 
+                $queries = @($queries | Where-Object { $_ -like '*policystates*' })
                 $queries.Count | Should -Be 1
                 $queries[0] | Should -Match 'resourceId = tolower\(tostring\(properties\.resourceId\)\)'
                 $queries[0] | Should -Match "(?s)stateWeight = case\(\s*complianceState =~ 'NonCompliant', 7,\s*complianceState =~ 'Compliant', 6,\s*complianceState =~ 'Error', 5,\s*complianceState in~ \('Conflict', 'Conflicting'\), 4,\s*complianceState =~ 'Protected', 3,\s*complianceState =~ 'Exempt', 2,\s*complianceState =~ 'Unknown', 1,\s*0\)"
@@ -404,7 +405,7 @@ Describe 'Policy effect resolution' {
                 $result.ComplianceCoverageIncomplete | Should -BeFalse
                 $result.HasComplianceData | Should -BeTrue
                 Should -Invoke Search-AzGraphSafe -Times 1 -Exactly -ParameterFilter {
-                    $All -and $First -eq 1000 -and @($Subscription).Count -eq 1 -and $Subscription[0] -eq $subId
+                    $Query -like '*policystates*' -and $All -and $First -eq 1000 -and @($Subscription).Count -eq 1 -and $Subscription[0] -eq $subId
                 }
             }
         }
