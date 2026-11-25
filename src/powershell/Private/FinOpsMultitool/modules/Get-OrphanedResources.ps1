@@ -22,7 +22,10 @@ function Get-OrphanedResources {
         [object[]]$Subscriptions,
 
         [Parameter()]
-        [switch]$SkipCost
+        [switch]$SkipCost,
+
+        [Parameter()]
+        [hashtable]$HubProvider
     )
 
     Write-Host "  Scanning for orphaned and idle resources..." -ForegroundColor Cyan
@@ -277,10 +280,9 @@ resources
     }
 
     # -- Observed cost per orphan (best effort) ---------------------------
-    # Cost Management is a separate grant from Reader, so a denial here leaves
-    # MonthlyCost null instead of failing the scan. The API rejects the
-    # TheLastMonth timeframe, so a full previous month needs an explicit Custom
-    # range, with month-to-date as the fallback.
+    # A selected Kusto provider aggregates ingested costs without live API fallback.
+    # Otherwise, use Cost Management with a custom previous-month range and a
+    # month-to-date fallback. Cost lookup failures leave inventory intact.
     $costMap = @{}
     $costFailures = [System.Collections.Generic.List[string]]::new()
     if ($SkipCost) { [void]$costFailures.Add('Cost lookup was not requested for the selected data source.') }
@@ -319,8 +321,51 @@ resources
             }
         }
     )
-    if ($allOrphans.Count -gt 0 -and -not $SkipCost) {
+    if ($allOrphans.Count -gt 0 -and -not $SkipCost -and $HubProvider) {
+        Write-Host "    Reading orphan costs from the Hub Kusto database..." -ForegroundColor Gray
+        try {
+            $resourceIds = @(
+                foreach ($orphan in $allOrphans) {
+                    if ($orphan.ResourceId) { [string]$orphan.ResourceId }
+                    if ($orphan.PSObject.Properties['ChildResourceIds']) {
+                        foreach ($childId in @($orphan.ChildResourceIds)) {
+                            if ($childId) { [string]$childId }
+                        }
+                    }
+                }
+            )
+            $hubPeriod = $lastMonthStart.ToString('MMM yyyy')
+            Write-Verbose "Orphan cost lookup: querying Hub Kusto for $hubPeriod across $($Subscriptions.Count) selected subscriptions and $($resourceIds.Count) resource IDs"
+            $hubCosts = Get-FOHubOrphanCosts -Provider $HubProvider -SubscriptionIds @($subIds) -ResourceIds $resourceIds -PeriodStart $lastMonthStart -PeriodEnd $firstOfThisMonth
+            if (-not $hubCosts.Ok) { throw "Hub orphan cost query failed: $($hubCosts.Error)" }
+            $hubCostMap = @{}
+            foreach ($row in $hubCosts.Rows) {
+                if ([string]::IsNullOrWhiteSpace($row.ResourceId) -or [string]::IsNullOrWhiteSpace($row.Currency)) {
+                    throw 'Hub orphan cost query returned a missing resource ID or billing currency.'
+                }
+                $key = ([string]$row.ResourceId).ToLowerInvariant()
+                if ($hubCostMap.ContainsKey($key)) { throw "Hub orphan cost query returned a duplicate resource ID: $($row.ResourceId)" }
+                $hubCostMap[$key] = [pscustomobject]@{
+                    Amount = [math]::Round((Get-HubCostValue -Row $row -Column 'Cost'), 2)
+                    Currency = ([string]$row.Currency).Trim().ToUpperInvariant()
+                }
+            }
+            $costMap = $hubCostMap
+            $costQueried = $Subscriptions.Count
+            $costPeriodLabel = $hubPeriod
+            Write-Verbose "Orphan cost lookup: Hub Kusto completed ($hubPeriod); received costs for $($costMap.Count) resource IDs"
+        }
+        catch {
+            [void]$costFailures.Add("$($_.Exception.Message) No live Cost Management fallback was attempted.")
+            Write-Verbose "Orphan cost lookup failed for the Hub Kusto source: $($_.Exception.Message)"
+        }
+    }
+    elseif ($allOrphans.Count -gt 0 -and -not $SkipCost) {
+        $subscriptionIndex = 0
         foreach ($sub in $Subscriptions) {
+            $subscriptionIndex++
+            $costContext = "Orphan cost lookup [$subscriptionIndex/$($Subscriptions.Count)] for '$($sub.Name)' ($($sub.Id))"
+            Write-Verbose "${costContext}: starting"
             $costResp = $null
             $usedLabel = $null
             $lastCode = 'no response'
@@ -328,13 +373,16 @@ resources
                 # A later subscription reuses whatever period already worked.
                 if ($costPeriodLabel -and $attempt.Label -ne $costPeriodLabel) { continue }
                 try {
+                    Write-Verbose "${costContext}: requesting $($attempt.Label) actual costs from Cost Management"
                     $body = $attempt.Body | ConvertTo-Json -Depth 10
                     $r = Invoke-AzRestMethodWithRetry -Path "/subscriptions/$($sub.Id)/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $body
                     if ($r -and $r.StatusCode -eq 200) { $costResp = $r; $usedLabel = $attempt.Label; break }
                     $lastCode = if ($r) { [string]$r.StatusCode } else { 'no response' }
+                    Write-Verbose "${costContext}: $($attempt.Label) request returned $lastCode"
                 }
                 catch {
                     $lastCode = $_.Exception.Message
+                    Write-Verbose "${costContext}: $($attempt.Label) request failed: $lastCode"
                 }
             }
 
@@ -346,12 +394,13 @@ resources
                     default { "Cost Management returned $lastCode" }
                 }
                 [void]$costFailures.Add("$($sub.Name): $reason")
+                Write-Verbose "${costContext}: skipping cost enrichment ($reason)"
                 continue
             }
 
             try {
                 # Follow nextLink: one page only would leave later orphans uncosted.
-                foreach ($page in (Get-CostQueryResponsePage -FirstResponse $costResp -Payload $body -Context "orphan cost for $($sub.Name)")) {
+                foreach ($page in (Get-CostQueryResponsePage -FirstResponse $costResp -Payload $body -Context $costContext)) {
                     $costResult = ($page.Content | ConvertFrom-Json)
                     $costCols = @{}
                     for ($cIdx = 0; $cIdx -lt $costResult.properties.columns.Count; $cIdx++) {
@@ -371,6 +420,7 @@ resources
                 }
                 if (-not $costPeriodLabel) { $costPeriodLabel = $usedLabel }
                 $costQueried++
+                Write-Verbose "${costContext}: completed ($usedLabel)"
             }
             catch {
                 [void]$costFailures.Add("$($sub.Name): $($_.Exception.Message)")
@@ -450,5 +500,6 @@ resources
         CostAvailable = $costAvailable
         CostPeriod    = $costPeriodLabel
         CostIssue     = $costIssue
+        CostSource    = if ($SkipCost) { 'None' } elseif ($HubProvider) { 'Kusto' } else { 'CostManagement' }
     }
 }

@@ -112,16 +112,29 @@ function Invoke-FOHubCostQuery {
         [Parameter(Mandatory)][hashtable]$Provider,
         [Parameter(Mandatory)][string]$Query,
         [string[]]$SubscriptionIds,
-        [int]$Months = 1
+        [int]$Months = 1,
+        [Nullable[datetime]]$PeriodStart,
+        [Nullable[datetime]]$PeriodEnd
     )
 
     $scope = Get-FOHubScopeClause -SubscriptionIds $SubscriptionIds
+    $anchor = Get-FOHubAnchorLet
+    $window = Get-FOHubWindowClause -Months $Months
+    if ($null -ne $PeriodStart -or $null -ne $PeriodEnd) {
+        if ($null -eq $PeriodStart -or $null -eq $PeriodEnd -or $PeriodEnd -le $PeriodStart) {
+            throw 'An explicit Hub cost period requires a start and a later exclusive end.'
+        }
+        $anchor = ''
+        $startLiteral = $PeriodStart.ToString('yyyy-MM-ddTHH:mm:ss', [cultureinfo]::InvariantCulture)
+        $endLiteral = $PeriodEnd.ToString('yyyy-MM-ddTHH:mm:ss', [cultureinfo]::InvariantCulture)
+        $window = "| where isnull(ChargePeriodStart) or (ChargePeriodStart >= datetime($startLiteral) and ChargePeriodStart < datetime($endLiteral))"
+    }
     $expectedIds = ConvertTo-Json -InputObject @($SubscriptionIds | Where-Object { $_ } | ForEach-Object { ([guid]$_).ToString() }) -Compress
     # Set difference is case-sensitive; extracted IDs must match the normalized GUIDs.
     $validatedQuery = @"
-$(Get-FOHubAnchorLet)
+$anchor
 let src = Costs
-$(Get-FOHubWindowClause -Months $Months)
+$window
 $scope
 | extend _cost = $($script:FOHubCostExpr), _sub = tolower(extract('([0-9a-fA-F-]{36})', 1, SubAccountId));
 let validation = src
@@ -252,6 +265,25 @@ src
     # Sort in PowerShell too (matches ConvertTo-ResourceCostsFromHub and is
     # robust even if the transport ever returns rows out of engine order).
     return @($out | Sort-Object -Property Actual -Descending)
+}
+
+function Get-FOHubOrphanCosts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Provider,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$SubscriptionIds,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$ResourceIds,
+        [Parameter(Mandatory)][datetime]$PeriodStart,
+        [Parameter(Mandatory)][datetime]$PeriodEnd
+    )
+
+    $ids = ConvertTo-Json -InputObject @($ResourceIds | Select-Object -Unique) -Compress
+    $query = @"
+src
+| where ResourceId in~ (dynamic($ids))
+| summarize Cost = sum(_cost), Currency = take_any(BillingCurrency) by ResourceId = tolower(ResourceId)
+"@
+    return Invoke-FOHubCostQuery -Provider $Provider -Query $query -SubscriptionIds $SubscriptionIds -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd
 }
 
 # -- Intent: cost by tag (matches ConvertTo-CostByTagFromHub) --------------

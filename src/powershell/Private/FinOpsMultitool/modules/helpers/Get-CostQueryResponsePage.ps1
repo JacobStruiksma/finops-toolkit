@@ -210,6 +210,7 @@ function Get-CostQueryResponsePage {
         }
 
         [void]$pages.Add($resp)
+        Write-Verbose "${Context}: received page $pageCount"
         if ([string]::IsNullOrWhiteSpace($next)) { break }
 
         $nextPath = Resolve-NextLinkPath -NextLink $next
@@ -228,6 +229,7 @@ function Get-CostQueryResponsePage {
             throw "$Context : the original POST payload is required for pagination; results are incomplete."
         }
         try {
+            Write-Verbose "${Context}: requesting page $($pageCount + 1)"
             $resp = if ($RootNextLink) {
                 Invoke-AzRestMethodWithRetry -Path $nextPath -Method GET
             }

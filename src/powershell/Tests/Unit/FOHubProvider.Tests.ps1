@@ -544,6 +544,50 @@ Describe 'FinOps Hub Kusto provider' {
         }
     }
 
+    Context 'Orphan cost aggregation' {
+        It 'Queries the explicit calendar month and all requested resources without a top limit' {
+            InModuleScope FinOpsMultitool {
+                $resourceIds = @(1..601 | ForEach-Object { "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg/providers/Microsoft.Compute/disks/disk$_" })
+                Mock Invoke-FOHubKustoQuery {
+                    @{ Ok = $true; Rows = @(
+                        [pscustomobject]@{ _CostValidation = $true; _InvalidCosts = 0; _CurrencyCount = 1; _SourceRows = 601; _MissingSubscriptions = 0 }
+                        foreach ($resourceId in $resourceIds) {
+                            [pscustomobject]@{ ResourceId = $resourceId; Cost = 1; Currency = 'USD' }
+                        }
+                    ) }
+                }
+                $provider = @{ UseAuth = $false; ClusterUri = 'http://localhost:8082'; Database = 'Hub' }
+
+                $result = Get-FOHubOrphanCosts -Provider $provider -SubscriptionIds @('11111111-1111-1111-1111-111111111111') -ResourceIds $resourceIds -PeriodStart '2026-10-01' -PeriodEnd '2026-11-01'
+
+                $result.Ok | Should -BeTrue
+                $result.Rows.Count | Should -Be 601
+                Should -Invoke Invoke-FOHubKustoQuery -Times 1 -Exactly -ParameterFilter {
+                    $Query.Contains('ChargePeriodStart >= datetime(2026-10-01T00:00:00)') -and
+                    $Query.Contains('ChargePeriodStart < datetime(2026-11-01T00:00:00)') -and
+                    $Query.Contains('SubAccountId has_any (dynamic(["11111111-1111-1111-1111-111111111111"]))') -and
+                    $Query.Contains('ResourceId in~ (dynamic(') -and $Query.Contains('disks/disk601') -and
+                    $Query.Contains('by ResourceId = tolower(ResourceId)') -and
+                    $Query.Contains('todouble(BilledCost)') -and
+                    $Query -notmatch '\|\s*(take|top)\s' -and $Query -notmatch '_anchor'
+                }
+            }
+        }
+
+        It 'Rejects invalid orphan cost periods before sending a query' -ForEach @(
+            @{ Start = '2026-11-01'; End = '2026-10-01' }
+            @{ Start = '2026-11-01'; End = '2026-11-01' }
+        ) {
+            InModuleScope FinOpsMultitool -Parameters @{ Start = $Start; End = $End } {
+                param($Start, $End)
+                Mock Invoke-FOHubKustoQuery { throw 'No query should be sent.' }
+                { Get-FOHubOrphanCosts -Provider @{} -SubscriptionIds @('11111111-1111-1111-1111-111111111111') -ResourceIds @('/resource') -PeriodStart $Start -PeriodEnd $End } |
+                    Should -Throw '*later exclusive end*'
+                Should -Invoke Invoke-FOHubKustoQuery -Times 0 -Exactly
+            }
+        }
+    }
+
     Context 'Get-FOHubCostByTag shape' {
         It 'Preserves tag value case and negative untagged credits' {
             InModuleScope FinOpsMultitool {
@@ -628,8 +672,9 @@ Describe 'FinOps Hub Kusto provider' {
             $provider = @{ UseAuth = $false; ClusterUri = 'http://localhost:8082'; Database = 'Hub' }
             (Get-FOHubCostSummary -Provider $provider).Error | Should -BeLike '*validation failed*'
             (Get-FOHubResourceCosts -Provider $provider -Top 1).Error | Should -BeLike '*validation failed*'
+            (Get-FOHubOrphanCosts -Provider $provider -SubscriptionIds @('aaaaaaaa-1111-2222-3333-444444444444') -ResourceIds @('/resource') -PeriodStart '2026-10-01' -PeriodEnd '2026-11-01').Ok | Should -BeFalse
             (Get-FOHubCostByTag -Provider $provider -TagKeys @('env')).Error | Should -BeLike '*validation failed*'
-            Should -Invoke Invoke-FOHubKustoQuery -Times 3 -Exactly -ParameterFilter {
+            Should -Invoke Invoke-FOHubKustoQuery -Times 4 -Exactly -ParameterFilter {
                 $Query.Contains('where isnull(ChargePeriodStart) or') -and
                 $Query.Contains('or isnull(ChargePeriodStart))')
             }
