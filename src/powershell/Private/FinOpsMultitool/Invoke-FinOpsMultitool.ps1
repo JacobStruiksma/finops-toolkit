@@ -450,13 +450,23 @@ function Invoke-FinOpsMultitool {
             return @{ Source = 'Hub'; HubStorage = $null; HubProvider = $provider }
         }
 
+        $hubStorageName = $env:FINOPS_HUB_STORAGE_ACCOUNT_NAME
+        if (-not [string]::IsNullOrWhiteSpace($hubStorageName)) {
+            $hubStorageName = $hubStorageName.Trim()
+            if ($hubStorageName -notmatch '^[a-z0-9]{3,24}$') {
+                throw "FINOPS_HUB_STORAGE_ACCOUNT_NAME must be a valid Azure Storage account name (3-24 lowercase letters or numbers)."
+            }
+        }
+
         # Try to detect a FinOps Hub in the selected subscriptions
         $hubStorage = $null
         $discoveryErrors = [Collections.Generic.List[string]]::new()
         Write-FinOpsConsole "  Checking for FinOps Hub deployment..." -ForegroundColor DarkGray
         foreach ($sub in $Subscriptions) {
             try {
-                $query = "resources | where type == 'microsoft.storage/storageaccounts' and tags['cm-resource-parent'] contains 'Microsoft.Cloud/hubs' | project name, resourceGroup, subscriptionId, location"
+                $query = "resources | where type == 'microsoft.storage/storageaccounts' and tags['cm-resource-parent'] contains 'Microsoft.Cloud/hubs'"
+                if ($hubStorageName) { $query += " and name == '$hubStorageName'" }
+                $query += ' | project name, resourceGroup, subscriptionId, location'
                 $result = Search-AzGraph -Query $query -Subscription $sub.Id -DefaultProfile $discoveryContext -ErrorAction Stop
                 if ($result -and @($result).Count -gt 0) {
                     $hubStorage = $result[0]
@@ -467,6 +477,13 @@ function Invoke-FinOpsMultitool {
                 $discoveryErrors.Add("$($sub.Name): $($_.Exception.Message)")
                 Write-FinOpsConsole "  Hub discovery failed for $($sub.Name): $($_.Exception.Message)" -ForegroundColor Yellow
             }
+        }
+
+        if ($hubStorageName -and -not $hubStorage -and $discoveryErrors.Count -gt 0) {
+            throw "Could not verify the configured FinOps Hub storage account '$hubStorageName' in the selected subscriptions: $($discoveryErrors -join '; ')"
+        }
+        if ($hubStorageName -and -not $hubStorage) {
+            throw "No FinOps Hub storage account named '$hubStorageName' was found in the selected subscriptions."
         }
 
         if (-not $hubStorage -and $discoveryErrors.Count -gt 0) {

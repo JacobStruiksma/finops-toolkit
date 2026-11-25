@@ -458,10 +458,23 @@ Reading Parquet requires a signature verifier: NuGet on Windows or .NET SDK 8 or
 
 #### Environment variables
 
+Idle VM detection batches Azure Monitor requests for up to 50 running VMs in the same subscription and region in Azure public cloud. It keeps the same 14-day CPU and network checks. Single-VM groups and other clouds use per-VM requests. Batch authentication or request failures warn before falling back to per-VM requests; rate-limited batches and missing or failed resource responses leave affected VMs unevaluated rather than treating them as active. Use `-Verbose` to see the batch number, subscription, region, VM count, fallback requests, and evaluation totals.
+
+Storage tier advice batches up to 50 accounts in the same subscription and region in Azure public cloud, fetching both 30-day blob transaction counts and capacity in each request. Recommendation thresholds stay unchanged. Single-account groups and other clouds keep per-account requests. Batch authentication or request failures warn before falling back; rate-limited batches and missing or invalid measurements leave affected accounts unevaluated, not idle. Use `-Verbose` to track batches, account evaluations, fallback requests, and evaluation totals. This scan uses Azure Monitor and doesn't require a Hub or Azure Data Explorer.
+
+Policy inventory lists effective policy assignments, including those inherited from management groups, with a few tenant-wide Azure Resource Graph queries instead of one ARM request per subscription. Each subscription's assignments are matched to its management group ancestors. When Resource Graph can't read an ancestor group, such as the tenant root group, one ARM read of a descendant subscription recovers that group's assignments. Subscriptions without an ancestor chain, or under a group that can't be recovered, still use per-subscription ARM requests. If a Resource Graph query fails or returns an unexpected assignment, a warning explains the fallback to ARM for every subscription. Use `-Verbose` to track ancestor coverage, recovery reads, and each ARM request.
+
+The orphan scan always discovers resources through Resource Graph. With a selected Kusto Hub, it queries the previous calendar month's `BilledCost` once across the selected subscriptions, matching orphan resource IDs and attached VM disk IDs without a top-resource limit. Cost freshness depends on Hub ingestion. Invalid costs, missing subscription coverage, or failed queries leave costs unavailable and retain the inventory; they don't trigger live Cost Management queries. A resource with no matching cost row remains uncosted, not zero cost.
+
+Without a Kusto provider, including a storage-only Hub, the existing per-subscription Cost Management API enrichment remains available. Export and GraphOnly still skip orphan cost enrichment. Results identify the enrichment source in `CostSource`.
+
+Run `Start-FinOpsMultitool -Verbose` to see the Kusto query's scope and period or the API lookup's subscription progress, result page numbers, and REST request attempts and retry waits. Page totals and completion times aren't known in advance.
+
 | Variable               | Effect                                                                                                                                      | Default               |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | `FINOPS_HUB_KUSTO_URI` | Kusto cluster query URI. An `https://...kusto.windows.net` cluster (token auth) or `http://localhost:<port>` ftklocal emulator (anonymous). | unset (no automatic discovery) |
 | `FINOPS_HUB_KUSTO_DB`  | Hub database name.                                                                                                                          | `Hub`                 |
+| `FINOPS_HUB_STORAGE_ACCOUNT_NAME` | Azure Storage account name of the Hub to select when using the storage reader. Must be discoverable in the selected subscriptions. | unset (automatic Hub discovery) |
 
 The tool loads hub summaries or storage rows once per run and reuses them for supported scans. It reports a failed query against the selected hub as an error and doesn't silently replace the result with API data.
 

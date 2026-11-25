@@ -46,7 +46,10 @@
 
     .PARAMETER DataSource
     Optional data source, which skips the data source prompt. Hub reads a configured
-    Kusto endpoint or a discovered FinOps hub. Export discovers existing CSV/CSV.gz Cost
+    Kusto endpoint or a discovered FinOps hub. Set FINOPS_HUB_STORAGE_ACCOUNT_NAME to
+    select a specific discovered Hub storage account when using the storage reader;
+    FINOPS_HUB_KUSTO_URI takes precedence when configured. If the named account cannot
+    be discovered in the selected subscriptions, the run stops. Export discovers existing CSV/CSV.gz Cost
     Management exports without requiring a hub, looking at definitions for the selected
     subscriptions, their management-group ancestors, and linked billing accounts, and at
     storage accounts in the selected subscriptions. A definition found at a wider scope can
