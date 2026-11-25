@@ -917,6 +917,156 @@ Describe 'Cost Management query pagination' {
         }
     }
 
+    Context 'Orphan costs from Kusto' {
+        BeforeEach {
+            Mock Write-Host -ModuleName FinOpsMultitool { }
+            Mock Search-AzGraphSafe -ModuleName FinOpsMultitool {
+                $diskId = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/disks/first'
+                $rows = @()
+                if ($Query.Contains("properties.diskState == 'Unattached'")) {
+                    $rows = @([pscustomobject]@{
+                            id = $diskId; name = 'first'; resourceGroup = 'test'
+                            subscriptionId = '11111111-1111-1111-1111-111111111111'; location = 'eastus'; diskSizeGb = 128; sku = 'Premium_LRS'
+                        })
+                }
+                elseif ($Query.Contains('VM deallocated')) {
+                    $rows = @([pscustomobject]@{
+                            id = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/virtualMachines/vm'
+                            name = 'vm'; resourceGroup = 'test'; subscriptionId = '11111111-1111-1111-1111-111111111111'; location = 'eastus'
+                            vmSize = 'Standard_D2s_v5'; osDiskId = $diskId; dataDisks = @()
+                        })
+                }
+                [pscustomobject]@{ Data = $rows }
+            }
+            Mock Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool { throw 'Kusto orphan costs must not query live costs.' }
+        }
+
+        It 'Enriches disks and VM child disks from one Kusto query and preserves <Amount>' -ForEach @(
+            @{ Amount = 123.45 }
+            @{ Amount = 0 }
+            @{ Amount = -12.5 }
+        ) {
+            $costAmount = $Amount
+            Mock Get-FOHubOrphanCosts -ModuleName FinOpsMultitool {
+                @{ Ok = $true; Rows = @([pscustomobject]@{
+                        ResourceId = '/SUBSCRIPTIONS/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/disks/first'
+                        Cost = $costAmount; Currency = 'USD'
+                    }) }
+            }
+            $subscriptions = @([pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'test' })
+            $provider = @{ Found = $true; Mode = 'Kusto'; ClusterUri = 'https://fixture.kusto.windows.net'; Database = 'Hub' }
+
+            $result = Get-OrphanedResources -Subscriptions $subscriptions -HubProvider $provider
+
+            $result.CostSource | Should -Be 'Kusto'
+            $result.CostAvailable | Should -BeTrue
+            $result.CostIssue | Should -BeNullOrEmpty
+            $result.TotalCount | Should -Be 2
+            $result.CostedCount | Should -Be 2
+            $result.MonthlyCost | Should -Be $Amount
+            ($result.Orphans | Where-Object Category -EQ 'Deallocated VM').AttachedCost | Should -Be $Amount
+            $result.CostPeriod | Should -Be (Get-Date -Day 1).AddMonths(-1).ToString('MMM yyyy')
+            Should -Invoke Get-FOHubOrphanCosts -ModuleName FinOpsMultitool -Times 1 -Exactly -ParameterFilter {
+                $Provider.ClusterUri -eq 'https://fixture.kusto.windows.net' -and
+                $SubscriptionIds.Count -eq 1 -and $SubscriptionIds[0] -eq '11111111-1111-1111-1111-111111111111' -and
+                $ResourceIds -contains '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/disks/first' -and
+                $ResourceIds -contains '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/virtualMachines/vm' -and
+                $PeriodStart -eq (Get-Date -Day 1).Date.AddMonths(-1) -and $PeriodEnd -eq (Get-Date -Day 1).Date
+            }
+            Should -Invoke Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool -Times 0 -Exactly
+        }
+
+        It 'Keeps inventory without live API fallback for <Case>' -ForEach @(
+            @{ Case = 'query failure'; Failure = 'return @{ Ok = $false; Error = "Synthetic query failure" }'; HasIssue = $true }
+            @{ Case = 'resolver exception'; Failure = 'throw "Synthetic query exception"'; HasIssue = $true }
+            @{ Case = 'no matching cost rows'; Failure = 'return @{ Ok = $true; Rows = @() }'; HasIssue = $false }
+            @{ Case = 'invalid returned cost'; Failure = 'return @{ Ok = $true; Rows = @([pscustomobject]@{ ResourceId = "/resource"; Cost = "invalid"; Currency = "USD" }) }'; HasIssue = $true }
+            @{ Case = 'missing currency'; Failure = 'return @{ Ok = $true; Rows = @([pscustomobject]@{ ResourceId = "/resource"; Cost = 1; Currency = "" }) }'; HasIssue = $true }
+            @{ Case = 'duplicate resource ID'; Failure = 'return @{ Ok = $true; Rows = @([pscustomobject]@{ ResourceId = "/resource"; Cost = 1; Currency = "USD" }, [pscustomobject]@{ ResourceId = "/RESOURCE"; Cost = 2; Currency = "USD" }) }'; HasIssue = $true }
+        ) {
+            Mock Get-FOHubOrphanCosts -ModuleName FinOpsMultitool ([scriptblock]::Create($Failure))
+            $subscriptions = @([pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'test' })
+
+            $result = Get-OrphanedResources -Subscriptions $subscriptions -HubProvider @{ Found = $true }
+
+            $result.TotalCount | Should -Be 2
+            $result.CostedCount | Should -Be 0
+            $result.MonthlyCost | Should -BeNullOrEmpty
+            $result.CostAvailable | Should -Be (-not $HasIssue)
+            if ($HasIssue) { $result.CostIssue | Should -BeLike '*No live Cost Management fallback*' }
+            else { $result.CostIssue | Should -BeNullOrEmpty }
+            Should -Invoke Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool -Times 0 -Exactly
+        }
+
+        It 'Does not query Kusto when cost enrichment is skipped' {
+            Mock Get-FOHubOrphanCosts -ModuleName FinOpsMultitool { throw 'SkipCost must take precedence.' }
+            $subscriptions = @([pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'test' })
+
+            $result = Get-OrphanedResources -Subscriptions $subscriptions -HubProvider @{ Found = $true } -SkipCost
+
+            $result.CostSource | Should -Be 'None'
+            $result.CostAvailable | Should -BeFalse
+            Should -Invoke Get-FOHubOrphanCosts -ModuleName FinOpsMultitool -Times 0 -Exactly
+            Should -Invoke Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool -Times 0 -Exactly
+        }
+    }
+
+    It 'Reports orphan cost loop progress only when verbose is <Enabled>' -ForEach @(
+        @{ Enabled = $true }
+        @{ Enabled = $false }
+    ) {
+        InModuleScope FinOpsMultitool -Parameters @{ Enabled = $Enabled } {
+            param($Enabled)
+            Mock Write-Host { }
+            Mock Search-AzGraphSafe {
+                $rows = @()
+                if ($Query.Contains("properties.diskState == 'Unattached'")) {
+                    $rows = @([pscustomobject]@{
+                            id = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/disks/first'
+                            name = 'first'; resourceGroup = 'test'; subscriptionId = '11111111-1111-1111-1111-111111111111'
+                            location = 'eastus'; diskSizeGb = 128; sku = 'Premium_LRS'
+                        })
+                }
+                [pscustomobject]@{ Data = $rows }
+            }
+            Mock Invoke-AzRestMethodWithRetry {
+                if (($Payload | ConvertFrom-Json).timeframe -eq 'Custom') {
+                    return [pscustomobject]@{ StatusCode = 403; Content = '{}' }
+                }
+                $body = @{
+                    properties = @{
+                        columns = @(@{ name = 'ResourceId' }, @{ name = 'Cost' }, @{ name = 'Currency' })
+                        rows = @(, @('/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/test/providers/Microsoft.Compute/disks/first', 100.0, 'USD'))
+                    }
+                }
+                if ($Path -notlike '*page=2') { $body.properties.nextLink = "$Path&page=2" }
+                [pscustomobject]@{ StatusCode = 200; Content = ($body | ConvertTo-Json -Depth 10) }
+            }
+            $subscriptions = @(
+                [pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'first' }
+                [pscustomobject]@{ Id = '22222222-2222-2222-2222-222222222222'; Name = 'second' }
+            )
+
+            $output = @(Get-OrphanedResources -Subscriptions $subscriptions -Verbose:$Enabled 4>&1)
+            $messages = @($output | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } | ForEach-Object Message)
+            $result = $output | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] }
+
+            $result.TotalCount | Should -Be 1
+            $result.CostAvailable | Should -BeTrue
+            $result.Orphans[0].MonthlyCost | Should -Be 100
+            if ($Enabled) {
+                $messages | Should -Contain "Orphan cost lookup [1/2] for 'first' (11111111-1111-1111-1111-111111111111): starting"
+                $messages | Should -Contain "Orphan cost lookup [2/2] for 'second' (22222222-2222-2222-2222-222222222222): starting"
+                $messages | Should -Contain "Orphan cost lookup [1/2] for 'first' (11111111-1111-1111-1111-111111111111): requesting Month to date actual costs from Cost Management"
+                $messages | Should -Contain "Orphan cost lookup [1/2] for 'first' (11111111-1111-1111-1111-111111111111): requesting page 2"
+                $messages | Should -Contain "Orphan cost lookup [1/2] for 'first' (11111111-1111-1111-1111-111111111111): received page 2"
+                $messages | Should -Contain "Orphan cost lookup [2/2] for 'second' (22222222-2222-2222-2222-222222222222): completed (Month to date)"
+            }
+            else { $messages.Count | Should -Be 0 }
+            Should -Invoke Invoke-AzRestMethodWithRetry -Times 5 -Exactly
+        }
+    }
+
     It 'Leaves orphan cost unavailable when its continuation fails' {
         InModuleScope FinOpsMultitool {
             Mock Search-AzGraphSafe {
