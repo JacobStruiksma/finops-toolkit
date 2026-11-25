@@ -38,6 +38,7 @@ foreach ($azMod in @('Az.Accounts', 'Az.Storage', 'Az.ResourceGraph')) {
 # -- Helpers (runspace pool, REST retry, ARG wrapper, MG-scope state) ----
 $helpersPath = Join-Path $PSScriptRoot 'modules\helpers'
 . (Join-Path $helpersPath 'Get-PlainAccessToken.ps1')
+. (Join-Path $helpersPath 'Get-FinOpsBatchMetrics.ps1')
 . (Join-Path $helpersPath 'Get-JitteredDelay.ps1')
 . (Join-Path $helpersPath 'Invoke-AzRestMethodWithRetry.ps1')
 . (Join-Path $helpersPath 'Get-CostQueryResponsePage.ps1')

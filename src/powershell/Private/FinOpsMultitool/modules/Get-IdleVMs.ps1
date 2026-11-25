@@ -89,6 +89,18 @@ resources
     $networkThreshold14d = $networkThreshold * 14
 
     $vmCount = $runningVMs.Count
+    $metricResources = @(
+        foreach ($vm in $runningVMs) {
+            [pscustomobject]@{
+                Id = "/subscriptions/$($vm.subscriptionId)/resourceGroups/$($vm.resourceGroup)/providers/Microsoft.Compute/virtualMachines/$($vm.name)"
+                subscriptionId = $vm.subscriptionId
+                location = $vm.location
+            }
+        }
+    )
+    $batches = Get-FinOpsBatchMetrics -Resources $metricResources -ArmEndpoint $armBase -MetricNamespace 'microsoft.compute/virtualmachines' -MetricNames @('Percentage CPU', 'Network In Total', 'Network Out Total') -Aggregation @('Average', 'Total') -StartTime $fourteenDaysAgo -EndTime $nowStr -Label VM
+    $batchMetrics = $batches.Metrics
+    $batchErrors = $batches.Errors
     $vmIdx = 0
     foreach ($vm in $runningVMs) {
         $vmIdx++
@@ -103,8 +115,16 @@ resources
             # FULL is the only way to get one datapoint for the whole span:
             # P14D is not a published timegrain and the API rejects it.
             $metricUri = "$armBase$scope/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=Percentage CPU,Network In Total,Network Out Total&timespan=$fourteenDaysAgo/$nowStr&aggregation=Average,Total&interval=FULL"
-            $resp = Invoke-WebRequest -Uri $metricUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
-            $metricData = ($resp.Content | ConvertFrom-Json)
+            if ($batchErrors.ContainsKey($scope)) { throw $batchErrors[$scope] }
+            if ($batchMetrics.ContainsKey($scope)) {
+                $metricData = $batchMetrics[$scope]
+                Write-Verbose "VM metrics [$vmIdx/$vmCount]: evaluating '$($vm.name)' in subscription $($vm.subscriptionId) from batch results"
+            }
+            else {
+                Write-Verbose "VM metrics [$vmIdx/$vmCount]: requesting '$($vm.name)' in subscription $($vm.subscriptionId) (timeout: 15 seconds)"
+                $resp = Invoke-WebRequest -Uri $metricUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
+                $metricData = ($resp.Content | ConvertFrom-Json)
+            }
 
             $avgCpu = $null
             $totalNetIn = 0
@@ -113,6 +133,7 @@ resources
             $networkOutSamples = 0
 
             foreach ($metric in $metricData.value) {
+                if ($metric.errorCode -and $metric.errorCode -ne 'Success') { throw "Metric returned $($metric.errorCode): $($metric.errorMessage)" }
                 $metricName = $metric.name.value
                 foreach ($ts in $metric.timeseries) {
                     foreach ($dp in $ts.data) {
@@ -174,8 +195,10 @@ resources
             # A throttled or unauthorized metrics call is not the same as a busy VM,
             # so count it rather than letting it read as "nothing to report".
             [void]$metricFailures.Add("$($vm.name): $($_.Exception.Message)")
+            Write-Verbose "VM metrics [$vmIdx/$vmCount]: '$($vm.name)' was not evaluated: $($_.Exception.Message)"
         }
     }
+    Write-Verbose "VM metrics completed: $($vmCount - $metricFailures.Count)/$vmCount VMs evaluated; $($metricFailures.Count) failed"
 
     if ($metricFailures.Count -gt 0) {
         Write-Warning "    Metrics unavailable for $($metricFailures.Count) of $($runningVMs.Count) VM(s); those VMs were not evaluated."

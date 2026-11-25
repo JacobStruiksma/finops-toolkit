@@ -54,15 +54,45 @@ resources
     $thirtyDaysAgo = $now.AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
     $nowStr = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
 
+    $metricResources = @(
+        foreach ($sa in $hotAccounts) {
+            [pscustomobject]@{
+                Id = "/subscriptions/$($sa.subscriptionId)/resourceGroups/$($sa.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($sa.name)/blobServices/default"
+                subscriptionId = $sa.subscriptionId
+                location = $sa.location
+            }
+        }
+    )
+    $batches = Get-FinOpsBatchMetrics -Resources $metricResources -ArmEndpoint $armBase -MetricNamespace 'microsoft.storage/storageaccounts/blobservices' -MetricNames @('Transactions', 'BlobCapacity') -Aggregation @('Total', 'Average') -StartTime $thirtyDaysAgo -EndTime $nowStr -Label Storage
+    $accountIndex = 0
     foreach ($sa in $hotAccounts) {
+        $accountIndex++
+        $context = "Storage metrics [$accountIndex/$($hotAccounts.Count)] for '$($sa.name)' in subscription $($sa.subscriptionId)"
         $scope = "/subscriptions/$($sa.subscriptionId)/resourceGroups/$($sa.resourceGroup)/providers/Microsoft.Storage/storageAccounts/$($sa.name)"
+        $blobId = "$scope/blobServices/default"
         try {
             # Query transaction count (Blob service) over last 30 days
             # FULL is the only way to get one datapoint for the whole span:
             # P30D is not a published timegrain and the API rejects it.
             $metricUri = "$armBase$scope/blobServices/default/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=Transactions&timespan=$thirtyDaysAgo/$nowStr&aggregation=Total&interval=FULL"
-            $resp = Invoke-WebRequest -Uri $metricUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
-            $metricData = ($resp.Content | ConvertFrom-Json)
+            if ($batches.Errors.ContainsKey($blobId)) { throw $batches.Errors[$blobId] }
+            if ($batches.Metrics.ContainsKey($blobId)) {
+                Write-Verbose "${context}: evaluating batch results"
+                $metrics = @($batches.Metrics[$blobId].value)
+                foreach ($metric in $metrics) {
+                    if ($metric.errorCode -and $metric.errorCode -ne 'Success') { throw "Metric returned $($metric.errorCode): $($metric.errorMessage)" }
+                }
+                $transactions = @($metrics | Where-Object { $_.name.value -eq 'Transactions' })
+                $capacity = @($metrics | Where-Object { $_.name.value -eq 'BlobCapacity' })
+                if ($transactions.Count -ne 1 -or $capacity.Count -ne 1) { throw 'The metrics batch must return Transactions and BlobCapacity exactly once.' }
+                $metricData = [pscustomobject]@{ value = $transactions }
+                $capData = [pscustomobject]@{ value = $capacity }
+            }
+            else {
+                Write-Verbose "${context}: requesting 30-day transactions (timeout: 15 seconds)"
+                $resp = Invoke-WebRequest -Uri $metricUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
+                $metricData = ($resp.Content | ConvertFrom-Json)
+            }
 
             $totalTx = 0.0
             $transactionSamples = 0
@@ -82,11 +112,14 @@ resources
             # capacity reading, so a silent failure here would suppress the
             # recommendation instead of reporting the account as unevaluated.
             $capacityUri = "$armBase$scope/blobServices/default/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=BlobCapacity&timespan=$thirtyDaysAgo/$nowStr&aggregation=Average&interval=FULL"
-            $capResp = Invoke-WebRequest -Uri $capacityUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
+            if (-not $batches.Metrics.ContainsKey($blobId)) {
+                Write-Verbose "${context}: requesting 30-day blob capacity (timeout: 15 seconds)"
+                $capResp = Invoke-WebRequest -Uri $capacityUri -Headers $headers -Method Get -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
+                $capData = ($capResp.Content | ConvertFrom-Json)
+            }
             $capacityBytes = 0.0
             $capacitySamples = 0
-            if ($capResp) {
-                $capData = ($capResp.Content | ConvertFrom-Json)
+            if ($capData) {
                 if ($capData.value -and $capData.value.Count -gt 0) {
                     foreach ($ts in $capData.value[0].timeseries) {
                         foreach ($dp in $ts.data) {
@@ -136,8 +169,10 @@ resources
             # A classic account with no blob service is expected; a throttled or
             # unauthorized call is not. Count both rather than reporting neither.
             [void]$metricFailures.Add("$($sa.name): $($_.Exception.Message)")
+            Write-Verbose "${context}: not evaluated: $($_.Exception.Message)"
         }
     }
+    Write-Verbose "Storage metrics completed: $($hotAccounts.Count - $metricFailures.Count)/$($hotAccounts.Count) accounts evaluated; $($metricFailures.Count) failed"
 
     if ($metricFailures.Count -gt 0) {
         Write-Warning "    Metrics unavailable for $($metricFailures.Count) of $($hotAccounts.Count) storage account(s); those accounts were not evaluated."
