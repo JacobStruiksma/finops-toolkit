@@ -138,10 +138,16 @@ $Fixture.Calls++
                 try {
                     $pool.Open()
                     $script:RunspacePool = $pool
-                    $response = Invoke-AzRestMethodWithRetry -Path '/subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.CostManagement/query?api-version=2023-11-01' -Payload '{}' -MaxRetries 1
+                    $VerbosePreference = 'Continue'
+                    $output = @(Invoke-AzRestMethodWithRetry -Path '/subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.CostManagement/query?api-version=2023-11-01' -Payload '{}' -MaxRetries 1 4>&1)
+                    $response = $output | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] }
+                    $messages = @($output | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } | ForEach-Object Message)
 
                     $response.StatusCode | Should -Be $Status
                     $fixture.Calls | Should -Be 2
+                    $messages | Should -Contain 'REST POST: attempt 1/2 for /subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.CostManagement/query?api-version=2023-11-01 (timeout: 60 seconds)'
+                    $messages | Should -Contain "REST POST: HTTP $Status for /subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.CostManagement/query?api-version=2023-11-01; waiting $ExpectedDelay seconds before retry 1/1"
+                    $messages | Should -Contain "REST POST: attempt 2/2 returned HTTP $Status for /subscriptions/11111111-1111-1111-1111-111111111111/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
                     Should -Invoke Wait-WithDispatcher -Times 1 -Exactly
                     Should -Invoke Wait-WithDispatcher -Times 1 -Exactly -ParameterFilter { $Milliseconds -eq $ExpectedDelay * 1000 }
                 }

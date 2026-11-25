@@ -1210,14 +1210,34 @@ function Invoke-FinOpsMultitool {
                 Should -Invoke Connect-AzAccount -Times 0 -Exactly
             }
 
-            It 'Skips orphan cost enrichment in GraphOnly mode' {
+            It 'Skips orphan cost enrichment in GraphOnly mode with verbose <Enabled>' -ForEach @(
+                @{ Enabled = $true }
+                @{ Enabled = $false }
+            ) {
                 $env:FINOPS_HUB_KUSTO_URI = $null
                 Mock Get-OrphanedResources { [pscustomobject]@{ Orphans = @(); TotalCount = 0; HasData = $false } }
 
-                Start-FinOpsExplorer -SubscriptionId '11111111-1111-1111-1111-111111111111' -Scans Get-OrphanedResources -DataSource GraphOnly -OutputPath (Join-Path $TestDrive 'graph-orphans') -NonInteractive -ErrorAction Stop
+                Start-FinOpsExplorer -SubscriptionId '11111111-1111-1111-1111-111111111111' -Scans Get-OrphanedResources -DataSource GraphOnly -OutputPath (Join-Path $TestDrive 'graph-orphans') -NonInteractive -Verbose:$Enabled -ErrorAction Stop
 
-                Should -Invoke Get-OrphanedResources -Times 1 -Exactly -ParameterFilter { $SkipCost }
+                Should -Invoke Get-OrphanedResources -Times 1 -Exactly -ParameterFilter { $SkipCost -and [bool]$Verbose -eq $Enabled }
                 Should -Invoke Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool -Times 0 -Exactly
+            }
+
+            It 'Forwards verbose <Enabled> to the <Scan> scan' -ForEach @(
+                @{ Enabled = $true; Scan = 'Get-IdleVMs' }
+                @{ Enabled = $false; Scan = 'Get-IdleVMs' }
+                @{ Enabled = $true; Scan = 'Get-StorageTierAdvice' }
+                @{ Enabled = $false; Scan = 'Get-StorageTierAdvice' }
+                @{ Enabled = $true; Scan = 'Get-PolicyInventory' }
+                @{ Enabled = $false; Scan = 'Get-PolicyInventory' }
+            ) {
+                Mock Get-IdleVMs { [pscustomobject]@{ IdleVMs = @(); Count = 0; HasData = $false; ScannedVMs = 0; EvaluatedVMs = 0; MetricFailures = 0 } }
+                Mock Get-StorageTierAdvice { [pscustomobject]@{ Recommendations = @(); Count = 0; HasData = $false; TotalHotAccounts = 0; EvaluatedAccounts = 0; MetricFailures = 0 } }
+                Mock Get-PolicyInventory { [pscustomobject]@{ Assignments = @(); AssignmentCount = 0; CoverageIncomplete = $false; HasComplianceData = $false } }
+
+                Start-FinOpsMultitool -SubscriptionId '11111111-1111-1111-1111-111111111111' -Scans $Scan -DataSource GraphOnly -OutputPath (Join-Path $TestDrive 'metrics-verbose') -NonInteractive -Verbose:$Enabled -ErrorAction Stop
+
+                Should -Invoke $Scan -Times 1 -Exactly -ParameterFilter { [bool]$Verbose -eq $Enabled }
             }
 
             It 'Rejects an unavailable explicit Hub rather than silently selecting API' {

@@ -1448,6 +1448,7 @@ function Invoke-FinOpsMultitool {
                             $params['RestrictToSelected'] = $true
                         }
                         if ($fn -eq 'Get-OrphanedResources' -and $DataSource.Source -in @('GraphOnly', 'Export')) { $params.SkipCost = $true }
+                        if ($fn -in @('Get-OrphanedResources', 'Get-IdleVMs', 'Get-StorageTierAdvice', 'Get-PolicyInventory')) { $params.Verbose = ($VerbosePreference -eq 'Continue') }
                         if ($fn -eq 'Get-ResourceCosts' -and $results['Get-CostData'] -is [hashtable]) { $params.CostData = $results['Get-CostData'] }
                         $output = & $fn @params
                     }
