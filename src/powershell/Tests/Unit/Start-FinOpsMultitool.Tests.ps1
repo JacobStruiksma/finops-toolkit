@@ -1235,7 +1235,7 @@ function Invoke-FinOpsMultitool {
                 Mock Get-StorageTierAdvice { [pscustomobject]@{ Recommendations = @(); Count = 0; HasData = $false; TotalHotAccounts = 0; EvaluatedAccounts = 0; MetricFailures = 0 } }
                 Mock Get-PolicyInventory { [pscustomobject]@{ Assignments = @(); AssignmentCount = 0; CoverageIncomplete = $false; HasComplianceData = $false } }
 
-                Start-FinOpsMultitool -SubscriptionId '11111111-1111-1111-1111-111111111111' -Scans $Scan -DataSource GraphOnly -OutputPath (Join-Path $TestDrive 'metrics-verbose') -NonInteractive -Verbose:$Enabled -ErrorAction Stop
+                Start-FinOpsExplorer -SubscriptionId '11111111-1111-1111-1111-111111111111' -Scans $Scan -DataSource GraphOnly -OutputPath (Join-Path $TestDrive 'metrics-verbose') -NonInteractive -Verbose:$Enabled -ErrorAction Stop
 
                 Should -Invoke $Scan -Times 1 -Exactly -ParameterFilter { [bool]$Verbose -eq $Enabled }
             }
