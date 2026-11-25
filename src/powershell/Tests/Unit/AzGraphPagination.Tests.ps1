@@ -42,6 +42,25 @@ Describe 'Resource Graph query pagination' {
         Should -Invoke Invoke-AzGraphQueryPage -ModuleName FinOpsMultitool -Times 1 -Exactly
     }
 
+    It 'Passes tenant scope to every page' {
+        Mock Invoke-AzGraphQueryPage -ModuleName FinOpsMultitool {
+            if (-not $SkipToken) { [PSCustomObject]@{ Data = @('a'); SkipToken = 'page2'; Count = 1 } }
+            else { [PSCustomObject]@{ Data = @('b'); SkipToken = $null; Count = 1 } }
+        }
+
+        $result = Search-AzGraphSafe -Query 'policyresources' -UseTenantScope -All
+
+        @($result.Data) | Should -Be @('a', 'b')
+        Should -Invoke Invoke-AzGraphQueryPage -ModuleName FinOpsMultitool -Times 2 -Exactly -ParameterFilter { $UseTenantScope -and -not $Subscription }
+    }
+
+    It 'Rejects tenant scope combined with a subscription list' {
+        Mock Invoke-AzGraphQueryPage -ModuleName FinOpsMultitool { throw 'Must not query.' }
+
+        { Search-AzGraphSafe -Query 'resources' -UseTenantScope -Subscription @('sub') } | Should -Throw
+        Should -Invoke Invoke-AzGraphQueryPage -ModuleName FinOpsMultitool -Times 0 -Exactly
+    }
+
     It 'Rejects an incomplete first page when all rows were requested' {
         Mock Invoke-AzGraphQueryPage -ModuleName FinOpsMultitool { $null }
 

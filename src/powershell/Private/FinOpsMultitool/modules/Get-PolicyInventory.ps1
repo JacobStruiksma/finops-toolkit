@@ -14,9 +14,10 @@ param()
 #          and return a summary of assigned policies, their effects,
 #          scopes, and compliance state.
 #
-# Strategy: Resource Graph for assignments (1 paginated call) +
-#           MG-scope Policy Insights for compliance (1 call).
-#           Falls back to per-sub only for small tenants if above fail.
+# Strategy: Resource Graph for effective assignments (a few tenant-wide
+#           queries, with ARM per-subscription reads only for subscriptions
+#           Resource Graph can't fully cover) + Resource Graph compliance.
+#           Falls back to per-sub only if above fail.
 ###########################################################################
 
 function Format-PolicyEffectName {
@@ -110,6 +111,165 @@ function Get-PolicyDefinitionMap {
     return $map
 }
 
+function ConvertTo-PolicyAssignmentRecord {
+    # One record shape for both the Resource Graph and ARM paths; both return
+    # the same assignment resource (id, name, properties).
+    param(
+        [Parameter(Mandatory)][object]$Assignment,
+        [string]$SubscriptionName
+    )
+    if ([string]::IsNullOrWhiteSpace([string]$Assignment.id) -or [string]::IsNullOrWhiteSpace([string]$Assignment.properties.policyDefinitionId)) {
+        throw 'A policy assignment has no resource ID or policy definition ID.'
+    }
+    $props = $Assignment.properties
+    $defId = $props.policyDefinitionId
+    $origin = if ($defId -match '/policySetDefinitions/') { 'Initiative' }
+    elseif ($defId -match '/providers/Microsoft\.Authorization/policyDefinitions/') { 'BuiltIn' }
+    else { 'Custom' }
+    $scope = if ($Assignment.id -match '^(.*)/providers/Microsoft\.Authorization/policyAssignments/') { $Matches[1] } else { '' }
+
+    return [PSCustomObject]@{
+        AssignmentName  = if ($props.displayName) { $props.displayName } else { $Assignment.name }
+        AssignmentId    = $Assignment.id
+        PolicyDefId     = $defId
+        Scope           = $scope
+        Effect          = if ($props.parameters -and $props.parameters.effect) { $props.parameters.effect.value } else { '-' }
+        EnforcementMode = if ($props.enforcementMode) { $props.enforcementMode } else { 'Default' }
+        Origin          = $origin
+        Subscription    = $SubscriptionName
+        Description     = if ($props.description) { $props.description } else { '' }
+    }
+}
+
+function Get-PolicyAssignmentGraphCoverage {
+    # Lists effective assignments for many subscriptions with a few tenant-wide
+    # Resource Graph queries instead of one ARM request per subscription.
+    #
+    # Subscription-scoped Resource Graph queries miss assignments inherited from
+    # management groups, so assignments are read at tenant scope and matched to
+    # each subscription's management group ancestors. A subscription counts as
+    # covered only when Resource Graph returns its ancestor chain and every
+    # ancestor management group is readable, either through Resource Graph or
+    # through one ARM read of a descendant subscription. Otherwise inherited
+    # assignments could be silently missing, so the caller reads it through ARM.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Subscriptions
+    )
+
+    $subIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
+    $chains = @{}
+    $subQuery = @"
+resourcecontainers
+| where type =~ 'microsoft.resources/subscriptions'
+| project id, subscriptionId, chain = properties.managementGroupAncestorsChain
+"@
+    $subResult = Search-AzGraphSafe -Query $subQuery -Subscription $subIds -First 1000 -All
+    foreach ($row in @($subResult.Data)) {
+        $names = @($row.chain | ForEach-Object { [string]$_.name } | Where-Object { $_ })
+        if ($row.subscriptionId -and $names.Count -gt 0) { $chains[[string]$row.subscriptionId] = $names }
+    }
+    Write-Verbose "Policy assignments: Resource Graph returned management group ancestors for $($chains.Count) of $($Subscriptions.Count) subscriptions"
+
+    $readableGroups = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($chains.Count -gt 0) {
+        $mgQuery = @"
+resourcecontainers
+| where type =~ 'microsoft.management/managementgroups'
+| project id, name
+"@
+        $mgResult = Search-AzGraphSafe -Query $mgQuery -UseTenantScope -First 1000 -All
+        foreach ($row in @($mgResult.Data)) { if ($row.name) { [void]$readableGroups.Add([string]$row.name) } }
+        Write-Verbose "Policy assignments: $($readableGroups.Count) management groups readable through Resource Graph"
+    }
+
+    # Resource Graph omits groups the caller can't read (often the tenant root
+    # group), so their assignments may be missing there. Any descendant
+    # subscription's ARM listing includes every inherited assignment, so one
+    # ARM read per unreadable group recovers them.
+    $probeByGroup = @{}
+    $failedGroups = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($subId in @($chains.Keys)) {
+        $hidden = @($chains[$subId] | Where-Object { -not $readableGroups.Contains($_) })
+        if ($hidden.Count -eq 0) { continue }
+        if (@($hidden | Where-Object { $failedGroups.Contains($_) }).Count -gt 0) { continue }
+        Write-Verbose "Policy assignments: reading subscription $subId through ARM to recover assignments at unreadable group(s) $($hidden -join ', ')"
+        $rows = [System.Collections.Generic.List[object]]::new()
+        $nextLink = "/subscriptions/$subId/providers/Microsoft.Authorization/policyAssignments?api-version=2022-06-01"
+        $ok = $true
+        while ($nextLink) {
+            $resp = Invoke-AzRestMethodWithRetry -Path $nextLink -Method GET
+            if ($resp.StatusCode -ne 200) { $ok = $false; break }
+            $body = $resp.Content | ConvertFrom-Json
+            if ($null -eq $body -or $body.value -isnot [array]) { $ok = $false; break }
+            $rows.AddRange([object[]]$body.value)
+            $nextLink = if ($body.nextLink) { $body.nextLink -replace '^https://management\.azure\.com', '' }
+        }
+        if (-not $ok) {
+            Write-Verbose "Policy assignments: ARM read of $subId failed; subscriptions under $($hidden -join ', ') use ARM"
+            foreach ($group in $hidden) { [void]$failedGroups.Add($group) }
+            continue
+        }
+        foreach ($group in $hidden) {
+            [void]$readableGroups.Add($group)
+            $probeByGroup[$group] = [System.Collections.Generic.List[object]]::new()
+        }
+        foreach ($row in $rows) {
+            if ([string]$row.id -match '^/providers/Microsoft\.Management/managementGroups/([^/]+)/providers/Microsoft\.Authorization/policyAssignments/[^/]+$' -and $hidden -contains $Matches[1]) {
+                [void]$probeByGroup[$Matches[1]].Add($row)
+            }
+        }
+    }
+
+    $covered = [System.Collections.Generic.List[object]]::new()
+    $uncovered = [System.Collections.Generic.List[object]]::new()
+    foreach ($sub in $Subscriptions) {
+        $chain = $chains[[string]$sub.Id]
+        if ($chain -and @($chain | Where-Object { -not $readableGroups.Contains($_) }).Count -eq 0) { [void]$covered.Add($sub) }
+        else { [void]$uncovered.Add($sub) }
+    }
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    if ($covered.Count -gt 0) {
+        $assignmentQuery = @"
+policyresources
+| where type =~ 'microsoft.authorization/policyassignments'
+| project id, name, properties
+"@
+        $assignmentResult = Search-AzGraphSafe -Query $assignmentQuery -UseTenantScope -First 1000 -All
+        $bySubscription = @{}
+        $byGroup = @{}
+        foreach ($row in @($assignmentResult.Data)) {
+            if ([string]::IsNullOrWhiteSpace([string]$row.id) -or [string]::IsNullOrWhiteSpace([string]$row.properties.policyDefinitionId)) {
+                throw 'A policy assignment has no resource ID or policy definition ID.'
+            }
+            $id = [string]$row.id
+            $map = $null
+            if ($id -match '^/subscriptions/([^/]+)/') { $key = $Matches[1]; $map = $bySubscription }
+            elseif ($id -match '^/providers/Microsoft\.Management/managementGroups/([^/]+)/providers/Microsoft\.Authorization/policyAssignments/[^/]+$') { $key = $Matches[1]; $map = $byGroup }
+            else { throw "Policy assignment '$id' has an unsupported scope." }
+            if (-not $map.ContainsKey($key)) { $map[$key] = [System.Collections.Generic.List[object]]::new() }
+            [void]$map[$key].Add($row)
+        }
+        Write-Verbose "Policy assignments: Resource Graph returned $(@($assignmentResult.Data).Count) assignments across the tenant"
+
+        foreach ($sub in $covered) {
+            $rows = [System.Collections.Generic.List[object]]::new()
+            if ($bySubscription.ContainsKey([string]$sub.Id)) { $rows.AddRange($bySubscription[[string]$sub.Id]) }
+            foreach ($group in $chains[[string]$sub.Id]) {
+                if ($byGroup.ContainsKey($group)) { $rows.AddRange($byGroup[$group]) }
+                if ($probeByGroup.ContainsKey($group)) { $rows.AddRange($probeByGroup[$group]) }
+            }
+            [void]$entries.Add([pscustomobject]@{ Subscription = $sub; Assignments = $rows.ToArray() })
+        }
+    }
+
+    return [pscustomobject]@{
+        Covered   = $entries.ToArray()
+        Uncovered = $uncovered.ToArray()
+    }
+}
+
 function Get-PolicyInventory {
     [CmdletBinding()]
     param(
@@ -129,15 +289,43 @@ function Get-PolicyInventory {
     $gotCompliance = $false
     $subFailures = [System.Collections.Generic.List[string]]::new()
 
-    # -- Strategy 1: ARM REST API for ALL effective assignments ----------
-    # Resource Graph policyresources at subscription scope only returns
-    # assignments AT that scope.  The ARM Policy API returns ALL effective
-    # assignments including those inherited from management groups and
-    # the tenant root group.
+    # -- Strategy 1: Resource Graph, then ARM for anything it can't cover --
+    # Resource Graph lists every effective assignment in a few tenant-wide
+    # queries. The ARM Policy API returns ALL effective assignments for one
+    # subscription, including those inherited from management groups and the
+    # tenant root group, but needs a request per subscription.
+    $seenIds = @{}
+    $armSubscriptions = @($Subscriptions)
     try {
-        Write-Host "  Querying policy assignments via ARM REST API..." -ForegroundColor Cyan
-        $seenIds = @{}
-        foreach ($sub in $Subscriptions) {
+        Write-Host "  Querying policy assignments via Resource Graph..." -ForegroundColor Cyan
+        $graph = Get-PolicyAssignmentGraphCoverage -Subscriptions $Subscriptions
+        $graphRecords = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $graphSeen = @{}
+        foreach ($entry in $graph.Covered) {
+            foreach ($a in $entry.Assignments) {
+                if ($graphSeen.ContainsKey($a.id)) { continue }
+                $graphSeen[$a.id] = $true
+                [void]$graphRecords.Add((ConvertTo-PolicyAssignmentRecord -Assignment $a -SubscriptionName $entry.Subscription.Name))
+            }
+        }
+        # Commit only after every row converted, so a malformed row can't leave a partial set.
+        $allAssignments.AddRange($graphRecords)
+        foreach ($id in $graphSeen.Keys) { $seenIds[$id] = $true }
+        $armSubscriptions = @($graph.Uncovered)
+        Write-Host "  Resource Graph: $($graphRecords.Count) unique policy assignments for $(@($graph.Covered).Count) of $subCount subscriptions (including inherited)" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "  Resource Graph policy assignment query failed: $($_.Exception.Message) Using per-subscription ARM requests."
+    }
+
+    try {
+        if ($armSubscriptions.Count -gt 0) {
+            Write-Host "  Querying policy assignments via ARM REST API for $($armSubscriptions.Count) subscription(s)..." -ForegroundColor Cyan
+        }
+        $armIndex = 0
+        foreach ($sub in $armSubscriptions) {
+            $armIndex++
+            Write-Verbose "Policy assignments [$armIndex/$($armSubscriptions.Count)]: reading '$($sub.Name)' ($($sub.Id)) through ARM"
             # Scoped per subscription: a transient failure on one must not abandon
             # the rest of the tenant and leave a partial result looking complete.
             try {
@@ -154,34 +342,11 @@ function Get-PolicyInventory {
                         throw 'The policy assignment response has no valid value collection.'
                     }
                     foreach ($a in $body.value) {
-                        if ([string]::IsNullOrWhiteSpace([string]$a.id) -or [string]::IsNullOrWhiteSpace([string]$a.properties.policyDefinitionId)) {
-                            throw 'A policy assignment has no resource ID or policy definition ID.'
-                        }
+                        $record = ConvertTo-PolicyAssignmentRecord -Assignment $a -SubscriptionName $subName
                         # De-duplicate (same MG assignment appears under each sub)
                         if ($seenIds.ContainsKey($a.id)) { continue }
                         $seenIds[$a.id] = $true
-
-                        $props = $a.properties
-                        $defId = $props.policyDefinitionId
-                        $origin = if ($defId -match '/policySetDefinitions/') { 'Initiative' }
-                        elseif ($defId -match '/providers/Microsoft\.Authorization/policyDefinitions/') { 'BuiltIn' }
-                        else { 'Custom' }
-                        $scope = if ($a.id -match '^(.*)/providers/Microsoft\.Authorization/policyAssignments/') {
-                            $Matches[1]
-                        }
-                        else { '' }
-
-                        [void]$allAssignments.Add([PSCustomObject]@{
-                                AssignmentName  = if ($props.displayName) { $props.displayName } else { $a.name }
-                                AssignmentId    = $a.id
-                                PolicyDefId     = $defId
-                                Scope           = $scope
-                                Effect          = if ($props.parameters -and $props.parameters.effect) { $props.parameters.effect.value } else { '-' }
-                                EnforcementMode = if ($props.enforcementMode) { $props.enforcementMode } else { 'Default' }
-                                Origin          = $origin
-                                Subscription    = $subName
-                                Description     = if ($props.description) { $props.description } else { '' }
-                            })
+                        [void]$allAssignments.Add($record)
                     }
                     # Handle pagination via nextLink
                     $nextLink = if ($body.nextLink) {
@@ -202,7 +367,9 @@ function Get-PolicyInventory {
 
         if ($subFailures.Count -eq 0 -or $allAssignments.Count -gt 0) {
             $gotAssignments = $true
-            Write-Host "  ARM REST API: $($allAssignments.Count) unique policy assignments (including inherited)" -ForegroundColor Green
+            if ($armSubscriptions.Count -gt 0) {
+                Write-Host "  Policy assignments: $($allAssignments.Count) unique (including inherited)" -ForegroundColor Green
+            }
         }
     }
     catch {
