@@ -229,6 +229,7 @@ function Invoke-FinOpsMultitool {
             BeforeEach {
                 $script:PreviousHubUri = $env:FINOPS_HUB_KUSTO_URI
                 $script:PreviousHubDatabase = $env:FINOPS_HUB_KUSTO_DB
+                $script:PreviousHubStorageAccountName = $env:FINOPS_HUB_STORAGE_ACCOUNT_NAME
                 $script:PreviousFinOpsResults = Get-Variable -Name FinOpsResults -Scope Global -ErrorAction SilentlyContinue
                 Mock Import-Module { }
                 Mock Get-Module { [pscustomobject]@{ Name = $Name } }
@@ -279,6 +280,7 @@ function Invoke-FinOpsMultitool {
             AfterEach {
                 $env:FINOPS_HUB_KUSTO_URI = $script:PreviousHubUri
                 $env:FINOPS_HUB_KUSTO_DB = $script:PreviousHubDatabase
+                $env:FINOPS_HUB_STORAGE_ACCOUNT_NAME = $script:PreviousHubStorageAccountName
                 if ($script:PreviousFinOpsResults) {
                     Set-Variable -Name FinOpsResults -Scope Global -Value $script:PreviousFinOpsResults.Value
                 }
@@ -785,6 +787,52 @@ function Invoke-FinOpsMultitool {
                 Should -Invoke Set-AzContext -Times 0 -Exactly
                 Should -Invoke Connect-AzAccount -Times 0 -Exactly
                 Should -Invoke Invoke-AzRestMethodWithRetry -ModuleName FinOpsMultitool -Times 0 -Exactly
+            }
+
+            It 'Selects the configured Hub storage account within the selected subscriptions' -Tag 'SourceSelectionIsolation' {
+                $env:FINOPS_HUB_KUSTO_URI = $null
+                $env:FINOPS_HUB_STORAGE_ACCOUNT_NAME = 'selectedhub'
+                Set-Variable -Name NonInteractive -Value $true -Scope Local
+                $launcherAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RealMultitoolRoot 'Invoke-FinOpsMultitool.ps1'), [ref]$null, [ref]$null)
+                foreach ($definition in $launcherAst.FindAll({
+                            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                            $args[0].Name -in @('Select-DataSource', 'Write-FinOpsConsole')
+                        }, $true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+                Mock Search-AzGraph {
+                    if ($Subscription -contains '22222222-2222-2222-2222-222222222222') {
+                        [pscustomobject]@{ name = 'selectedhub'; resourceGroup = 'selected-group' }
+                    }
+                    else {
+                        @()
+                    }
+                }
+                $subscriptions = @(
+                    [pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; TenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }
+                    [pscustomobject]@{ Id = '22222222-2222-2222-2222-222222222222'; TenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }
+                )
+
+                $choice = Select-DataSource -TenantId 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -Subscriptions $subscriptions
+
+                $choice.Source | Should -Be 'Hub'
+                $choice.HubStorage.name | Should -Be 'selectedhub'
+                $choice.HubStorage.resourceGroup | Should -Be 'selected-group'
+                Should -Invoke Search-AzGraph -Times 2 -Exactly -ParameterFilter { $Query -match "name == 'selectedhub'" }
+            }
+
+            It 'Rejects a configured Hub storage account that cannot be found' -Tag 'SourceSelectionIsolation' {
+                $env:FINOPS_HUB_KUSTO_URI = $null
+                $env:FINOPS_HUB_STORAGE_ACCOUNT_NAME = 'missinghub'
+                Set-Variable -Name NonInteractive -Value $true -Scope Local
+                $launcherAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RealMultitoolRoot 'Invoke-FinOpsMultitool.ps1'), [ref]$null, [ref]$null)
+                foreach ($definition in $launcherAst.FindAll({
+                            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                            $args[0].Name -in @('Select-DataSource', 'Write-FinOpsConsole')
+                        }, $true)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+                Mock Search-AzGraph { @() }
+                $subscriptions = @([pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; TenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' })
+
+                { Select-DataSource -TenantId 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' -Subscriptions $subscriptions } |
+                    Should -Throw "*No FinOps Hub storage account named 'missinghub'*"
             }
 
             It 'Maps source choice <Answer> to <ExpectedSource> when a Hub is <HubState>' -Tag 'SourceSelectionIsolation' -ForEach @(
