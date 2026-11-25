@@ -188,10 +188,12 @@ function Invoke-AzRestMethodWithRetry {
     # The wait budget doesn't matter here: a request sent before the recorded time only draws another 429.
     $throttleKey = Get-CostMgmtThrottleKey -Path $Path
     if ($throttleKey -and (Get-CostMgmtThrottleRemaining -Key $throttleKey) -gt 0) {
+        Write-Verbose "REST ${Method}: skipping $Path because the Cost Management $throttleKey throttle window is active"
         return New-CostMgmtSkippedResponse -Key $throttleKey
     }
     $retryWaitSeconds = 0.0
     for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
+        Write-Verbose "REST ${Method}: attempt $($attempt + 1)/$($MaxRetries + 1) for $Path (timeout: $TimeoutSeconds seconds)"
         $ps = [powershell]::Create()
         $ps.RunspacePool = $script:RunspacePool
         [void]$ps.AddScript({
@@ -262,6 +264,7 @@ function Invoke-AzRestMethodWithRetry {
         if ($null -eq $resp.Content) {
             $resp = [PSCustomObject]@{ StatusCode = $resp.StatusCode; Content = '{}'; Headers = if ($resp.Headers) { $resp.Headers } else { @{} } }
         }
+        Write-Verbose "REST ${Method}: attempt $($attempt + 1)/$($MaxRetries + 1) returned HTTP $($resp.StatusCode) for $Path"
 
         # 429 and transient 5xx are both retryable. 5xx also covers the synthetic
         # 503 this function raises for transport failures, which are the most
@@ -294,6 +297,7 @@ function Invoke-AzRestMethodWithRetry {
         }
         $friendly = if ($isThrottled) { Get-NextThrottleMessage } else { "Azure returned $($resp.StatusCode) - retrying..." }
         Write-Host "  $friendly" -ForegroundColor Yellow
+        Write-Verbose "REST ${Method}: HTTP $($resp.StatusCode) for $Path; waiting $([math]::Ceiling($retryAfter)) seconds before retry $($attempt + 1)/$MaxRetries"
 
         if (Get-Command Update-ScanStatus -ErrorAction SilentlyContinue) {
             Update-ScanStatus $friendly
